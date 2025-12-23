@@ -1,2 +1,34 @@
+# Data files
 *.csv
 *.zip
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+venv/
+ENV/
+
+# Models and logs
+models/
+logs/
+cache/
+*.pkl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
