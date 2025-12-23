@@ -37,6 +37,8 @@ class BitcoinTradingEnv(gym.Env):
         tp_options: list = None,
         spread_pct: float = 0.001,
         commission_pct: float = 0.001,
+        max_position_pct: float = 0.20,  # Max %20 risk per trade
+        simple_actions: bool = True,  # Use simplified 5-action space
         render_mode: str = None
     ):
         super().__init__()
@@ -48,19 +50,29 @@ class BitcoinTradingEnv(gym.Env):
         self.max_position_duration = max_position_duration
         self.spread_pct = spread_pct
         self.commission_pct = commission_pct
+        self.max_position_pct = max_position_pct  # Max position size as % of capital
+        self.simple_actions = simple_actions
         self.render_mode = render_mode
 
         # SL/TP options as percentages
         self.sl_options = sl_options or [0.01, 0.02, 0.03]
         self.tp_options = tp_options or [0.02, 0.04, 0.06]
 
-        # Calculate number of actions
-        # 0: Hold, 1-9: Long positions, 10-18: Short positions, 19: Close
-        n_sl = len(self.sl_options)
-        n_tp = len(self.tp_options)
-        self.n_long_actions = n_sl * n_tp
-        self.n_short_actions = n_sl * n_tp
-        self.n_actions = 1 + self.n_long_actions + self.n_short_actions + 1
+        # Default SL/TP for simple mode (middle values)
+        self.default_sl = self.sl_options[len(self.sl_options) // 2]
+        self.default_tp = self.tp_options[len(self.tp_options) // 2]
+
+        if self.simple_actions:
+            # Simple mode: 5 actions
+            # 0: Hold, 1: Long, 2: Short, 3: Close, 4: Hold (duplicate for symmetry)
+            self.n_actions = 5
+        else:
+            # Complex mode: Full SL/TP combinations
+            n_sl = len(self.sl_options)
+            n_tp = len(self.tp_options)
+            self.n_long_actions = n_sl * n_tp
+            self.n_short_actions = n_sl * n_tp
+            self.n_actions = 1 + self.n_long_actions + self.n_short_actions + 1
 
         # Action space
         self.action_space = spaces.Discrete(self.n_actions)
@@ -86,23 +98,34 @@ class BitcoinTradingEnv(gym.Env):
 
     def _build_action_map(self):
         """Build mapping from action index to (direction, sl, tp)."""
-        self.action_map = {0: ('hold', None, None)}
+        if self.simple_actions:
+            # Simple 5-action mode
+            self.action_map = {
+                0: ('hold', None, None),
+                1: ('long', self.default_sl, self.default_tp),
+                2: ('short', self.default_sl, self.default_tp),
+                3: ('close', None, None),
+                4: ('hold', None, None),  # Extra hold for balanced action space
+            }
+        else:
+            # Complex mode with all SL/TP combinations
+            self.action_map = {0: ('hold', None, None)}
 
-        action_idx = 1
-        # Long positions
-        for sl in self.sl_options:
-            for tp in self.tp_options:
-                self.action_map[action_idx] = ('long', sl, tp)
-                action_idx += 1
+            action_idx = 1
+            # Long positions
+            for sl in self.sl_options:
+                for tp in self.tp_options:
+                    self.action_map[action_idx] = ('long', sl, tp)
+                    action_idx += 1
 
-        # Short positions
-        for sl in self.sl_options:
-            for tp in self.tp_options:
-                self.action_map[action_idx] = ('short', sl, tp)
-                action_idx += 1
+            # Short positions
+            for sl in self.sl_options:
+                for tp in self.tp_options:
+                    self.action_map[action_idx] = ('short', sl, tp)
+                    action_idx += 1
 
-        # Close position
-        self.action_map[action_idx] = ('close', None, None)
+            # Close position
+            self.action_map[action_idx] = ('close', None, None)
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
         """Reset the environment to initial state."""
@@ -211,9 +234,12 @@ class BitcoinTradingEnv(gym.Env):
             self.stop_loss = entry_price * (1 + sl_pct)
             self.take_profit = entry_price * (1 - tp_pct)
 
-        # Position size (use all available capital for simplicity)
-        self.position_size = self.capital
+        # Position size - use max_position_pct of capital (default 20%)
+        self.position_size = self.capital * self.max_position_pct
         commission = self.position_size * self.commission_pct
+
+        # Reserve position size from capital (money is now in the trade)
+        self.capital -= self.position_size
         self.capital -= commission
 
         self.position = direction
@@ -240,8 +266,8 @@ class BitcoinTradingEnv(gym.Env):
         commission = abs(self.position_size * (1 + pnl_pct)) * self.commission_pct
         net_pnl = gross_pnl - commission
 
-        # Update capital
-        self.capital = self.position_size + net_pnl
+        # Update capital - add back position size plus/minus PnL
+        self.capital += self.position_size + net_pnl
 
         # Record trade
         self.trades.append({
@@ -308,7 +334,7 @@ class BitcoinTradingEnv(gym.Env):
         sl_tp_hit = self._check_sl_tp()
         if sl_tp_hit:
             pnl = self._close_position(reason=sl_tp_hit)
-            reward = self._calculate_reward(pnl)
+            reward = self._calculate_reward(pnl, reason=sl_tp_hit)
 
         # Execute action
         if self.position is None:
@@ -319,15 +345,18 @@ class BitcoinTradingEnv(gym.Env):
             # Have position
             if action_type == 'close':
                 pnl = self._close_position(reason='manual')
-                reward = self._calculate_reward(pnl)
+                reward = self._calculate_reward(pnl, reason='manual')
             elif self.position_duration >= self.max_position_duration:
                 # Force close if max duration reached
                 pnl = self._close_position(reason='max_duration')
-                reward = self._calculate_reward(pnl)
+                reward = self._calculate_reward(pnl, reason='max_duration')
 
         # Update position duration
         if self.position is not None:
             self.position_duration += 1
+
+        # Add step-based reward (intermediate feedback)
+        reward += self._calculate_step_reward()
 
         # Update equity
         self.equity = self.capital + self._calculate_unrealized_pnl()
@@ -341,7 +370,7 @@ class BitcoinTradingEnv(gym.Env):
             # Close any open position at end
             if self.position is not None:
                 pnl = self._close_position(reason='episode_end')
-                reward += self._calculate_reward(pnl)
+                reward += self._calculate_reward(pnl, reason='episode_end')
             done = True
 
         # Check for bankruptcy
@@ -354,19 +383,67 @@ class BitcoinTradingEnv(gym.Env):
 
         return obs, reward, done, truncated, info
 
-    def _calculate_reward(self, pnl: float) -> float:
+    def _calculate_reward(self, pnl: float, reason: str = 'manual') -> float:
         """
         Calculate reward for a trade.
-        Uses risk-adjusted returns.
+        Risk-adjusted with bonuses/penalties.
         """
         # Normalize PnL by initial capital
         normalized_pnl = pnl / self.initial_capital
 
-        # Base reward is the normalized PnL
-        reward = normalized_pnl * 100  # Scale for better learning
+        # Base reward is the normalized PnL (scaled)
+        reward = normalized_pnl * 100
 
-        # Small penalty for each step to encourage efficiency
-        # reward -= 0.001
+        # Bonus for take profit hits (good exit)
+        if reason == 'take_profit':
+            reward *= 1.5  # 50% bonus for TP
+
+        # Smaller penalty for stop loss (it's risk management, not bad)
+        elif reason == 'stop_loss':
+            reward *= 0.8  # Reduce penalty - SL is protective
+
+        # Penalty for max duration timeout (bad exit strategy)
+        elif reason == 'max_duration':
+            reward *= 0.5  # 50% penalty - should have exited earlier
+
+        # Bonus for profitable manual exits
+        elif reason == 'manual' and pnl > 0:
+            reward *= 1.2  # 20% bonus for good manual exit
+
+        # Episode end - neutral, no bonus/penalty
+        elif reason == 'episode_end':
+            pass  # Keep base reward
+
+        return reward
+
+    def _calculate_step_reward(self) -> float:
+        """
+        Calculate step-based reward for holding positions.
+        Gives intermediate feedback during trades.
+        """
+        reward = 0.0
+
+        if self.position is not None:
+            # Unrealized PnL feedback (small, to guide learning)
+            unrealized = self._calculate_unrealized_pnl()
+            normalized_unrealized = unrealized / self.initial_capital
+
+            # Small reward/penalty based on unrealized PnL
+            reward += normalized_unrealized * 2  # Scaled down for step reward
+
+            # Penalty for holding too long (encourages timely exits)
+            duration_ratio = self.position_duration / self.max_position_duration
+            if duration_ratio > 0.5:  # After 50% of max duration
+                reward -= 0.01 * duration_ratio  # Increasing penalty
+
+            # Risk penalty - if position is in significant drawdown
+            if normalized_unrealized < -0.02:  # More than 2% loss
+                reward -= 0.02  # Extra penalty for risky positions
+
+        else:
+            # Small penalty for being idle too long (encourages action)
+            # But not too much - waiting for good entry is valid
+            pass
 
         return reward
 

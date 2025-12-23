@@ -423,6 +423,18 @@ def page_overview():
         st.info("No trained models found. Go to Training page to train a model.")
 
 
+def read_training_progress():
+    """Read training progress from JSON file."""
+    progress_file = Path(__file__).parent.parent / "logs" / "training_progress.json"
+    if progress_file.exists():
+        try:
+            with open(progress_file, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
 def page_training():
     """Training page."""
     st.title("Model Training")
@@ -433,6 +445,16 @@ def page_training():
     if not config:
         st.error("Configuration file not found!")
         return
+
+    # Check if training is in progress
+    progress_data = read_training_progress()
+    is_training = False
+    if progress_data and progress_data.get('status') == 'running':
+        try:
+            last_update = datetime.fromisoformat(progress_data.get('timestamp', '2000-01-01'))
+            is_training = (datetime.now() - last_update).seconds < 10
+        except Exception:
+            is_training = False
 
     # Training parameters
     st.subheader("Training Parameters")
@@ -445,7 +467,8 @@ def page_training():
             min_value=10000,
             max_value=10000000,
             value=config['model']['total_timesteps'],
-            step=10000
+            step=10000,
+            disabled=is_training
         )
 
         learning_rate = st.number_input(
@@ -453,20 +476,23 @@ def page_training():
             min_value=0.00001,
             max_value=0.01,
             value=config['model']['learning_rate'],
-            format="%.5f"
+            format="%.5f",
+            disabled=is_training
         )
 
     with col2:
         batch_size = st.selectbox(
             "Batch Size",
             options=[32, 64, 128, 256],
-            index=[32, 64, 128, 256].index(config['model']['batch_size'])
+            index=[32, 64, 128, 256].index(config['model']['batch_size']),
+            disabled=is_training
         )
 
         n_steps = st.selectbox(
             "N Steps",
             options=[512, 1024, 2048, 4096],
-            index=[512, 1024, 2048, 4096].index(config['model']['n_steps'])
+            index=[512, 1024, 2048, 4096].index(config['model']['n_steps']),
+            disabled=is_training
         )
 
     with col3:
@@ -475,7 +501,8 @@ def page_training():
             min_value=0.9,
             max_value=0.999,
             value=config['model']['gamma'],
-            step=0.001
+            step=0.001,
+            disabled=is_training
         )
 
         ent_coef = st.slider(
@@ -483,7 +510,8 @@ def page_training():
             min_value=0.0,
             max_value=0.1,
             value=config['model']['ent_coef'],
-            step=0.001
+            step=0.001,
+            disabled=is_training
         )
 
     st.markdown("---")
@@ -493,66 +521,120 @@ def page_training():
     col1, col2 = st.columns(2)
 
     with col1:
-        train_start = st.date_input("Train Start", value=pd.to_datetime(config['data']['train_start']))
-        train_end = st.date_input("Train End", value=pd.to_datetime(config['data']['train_end']))
+        train_start = st.date_input("Train Start", value=pd.to_datetime(config['data']['train_start']), disabled=is_training)
+        train_end = st.date_input("Train End", value=pd.to_datetime(config['data']['train_end']), disabled=is_training)
 
     with col2:
-        test_start = st.date_input("Test Start", value=pd.to_datetime(config['data']['test_start']))
-        test_end = st.date_input("Test End", value=pd.to_datetime(config['data']['test_end']))
+        test_start = st.date_input("Test Start", value=pd.to_datetime(config['data']['test_start']), disabled=is_training)
+        test_end = st.date_input("Test End", value=pd.to_datetime(config['data']['test_end']), disabled=is_training)
 
     st.markdown("---")
 
-    # Training control
-    if st.button("Start Training", type="primary", use_container_width=True):
-        st.info("Training started! Check the terminal for detailed progress.")
+    # Show real-time progress if training is running
+    if is_training:
+        st.subheader("Training Progress")
 
-        # Save updated config
-        config['model']['total_timesteps'] = total_timesteps
-        config['model']['learning_rate'] = learning_rate
-        config['model']['batch_size'] = batch_size
-        config['model']['n_steps'] = n_steps
-        config['model']['gamma'] = gamma
-        config['model']['ent_coef'] = ent_coef
-        config['data']['train_start'] = str(train_start)
-        config['data']['train_end'] = str(train_end)
-        config['data']['test_start'] = str(test_start)
-        config['data']['test_end'] = str(test_end)
+        # Progress bar
+        progress_percent = progress_data.get('percent', 0)
+        st.progress(progress_percent / 100)
 
-        config_path = Path(__file__).parent.parent / "config.yaml"
-        with open(config_path, 'w') as f:
-            yaml.dump(config, f, default_flow_style=False)
+        # Metrics row
+        col1, col2, col3, col4 = st.columns(4)
 
-        # Run training
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        with col1:
+            st.metric(
+                "Progress",
+                f"{progress_percent:.1f}%",
+                f"{progress_data.get('current_step', 0):,} / {progress_data.get('total_steps', 0):,}"
+            )
 
-        try:
-            from train import train
+        with col2:
+            st.metric(
+                "Elapsed",
+                progress_data.get('elapsed_formatted', '0s'),
+                f"ETA: {progress_data.get('eta_formatted', 'N/A')}"
+            )
 
-            status_text.text("Loading data and initializing...")
-            progress_bar.progress(10)
+        with col3:
+            st.metric(
+                "Episodes",
+                progress_data.get('episodes', 0),
+                f"{progress_data.get('steps_per_second', 0):.0f} steps/s"
+            )
 
-            # This will run the training
-            # Note: For real-time updates, you'd need a more complex callback system
-            status_text.text("Training in progress... Check terminal for details")
-            progress_bar.progress(50)
+        with col4:
+            avg_reward = progress_data.get('avg_reward', 0)
+            st.metric(
+                "Avg Reward (last 10)",
+                f"{avg_reward:.1f}",
+                f"Avg Length: {progress_data.get('avg_length', 0):.0f}"
+            )
 
-            model, env = train()
+        # Auto-refresh
+        st.info("Training in progress... Page will auto-refresh every 2 seconds.")
+        time.sleep(2)
+        st.rerun()
 
-            progress_bar.progress(100)
-            status_text.text("Training completed!")
-            st.success("Model trained successfully!")
+    else:
+        # Training control
+        if st.button("Start Training", type="primary", use_container_width=True):
+            # Save updated config
+            config['model']['total_timesteps'] = total_timesteps
+            config['model']['learning_rate'] = learning_rate
+            config['model']['batch_size'] = batch_size
+            config['model']['n_steps'] = n_steps
+            config['model']['gamma'] = gamma
+            config['model']['ent_coef'] = ent_coef
+            config['data']['train_start'] = str(train_start)
+            config['data']['train_end'] = str(train_end)
+            config['data']['test_start'] = str(test_start)
+            config['data']['test_end'] = str(test_end)
 
-        except Exception as e:
-            st.error(f"Training error: {str(e)}")
-            import traceback
-            st.code(traceback.format_exc())
+            config_path = Path(__file__).parent.parent / "config.yaml"
+            with open(config_path, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False)
+
+            # Clear old progress file
+            progress_file = Path(__file__).parent.parent / "logs" / "training_progress.json"
+            if progress_file.exists():
+                progress_file.unlink()
+
+            # Start training in a subprocess
+            import subprocess
+            train_script = Path(__file__).parent / "train.py"
+
+            # Run training in background
+            subprocess.Popen(
+                [sys.executable, str(train_script)],
+                cwd=str(Path(__file__).parent.parent),
+                creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0
+            )
+
+            st.success("Training started! Progress will appear below...")
+            time.sleep(2)
+            st.rerun()
+
+        # Show last training result if available
+        if progress_data and progress_data.get('status') == 'completed':
+            st.markdown("---")
+            st.subheader("Last Training Result")
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                st.metric("Status", "Completed")
+            with col2:
+                st.metric("Total Time", progress_data.get('elapsed_formatted', 'N/A'))
+            with col3:
+                st.metric("Episodes", progress_data.get('episodes', 0))
+            with col4:
+                st.metric("Final Avg Reward", f"{progress_data.get('avg_reward', 0):.1f}")
 
     # TensorBoard link
     st.markdown("---")
     st.subheader("TensorBoard")
     st.code("tensorboard --logdir logs/tensorboard/", language="bash")
-    st.info("Run this command in terminal to view training progress in TensorBoard")
+    st.info("Run this command in terminal to view detailed training metrics")
 
 
 def page_backtest():
@@ -606,6 +688,8 @@ def page_backtest():
                     window_size=config['environment']['window_size'],
                     initial_capital=config['environment']['initial_capital'],
                     max_position_duration=config['environment']['max_position_duration'],
+                    max_position_pct=config['environment'].get('max_position_pct', 0.20),
+                    simple_actions=config['environment'].get('simple_actions', True),
                     sl_options=config['trading']['sl_options'],
                     tp_options=config['trading']['tp_options'],
                     spread_pct=config['trading']['spread_pct'],

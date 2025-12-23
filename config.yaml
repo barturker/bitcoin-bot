@@ -8,6 +8,8 @@ data:
 environment:
   initial_capital: 10000
   max_position_duration: 72
+  max_position_pct: 0.2
+  simple_actions: true
   window_size: 48
 features:
   indicators:
@@ -42,7 +44,7 @@ model:
   n_epochs: 10
   n_steps: 2048
   policy: MlpPolicy
-  total_timesteps: 100000
+  total_timesteps: 500000
 trading:
   commission_pct: 0.001
   sl_options:

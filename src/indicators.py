@@ -80,18 +80,70 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_trend"] = (df["ema_12"] > df["ema_26"]).astype(int)
     df["higher_high"] = (df["high"] > df["high"].shift(1)).astype(int)
     df["lower_low"] = (df["low"] < df["low"].shift(1)).astype(int)
-    
+
+    # ============ TREND FILTER - Bull/Bear Market Detection ============
+
+    # Price position relative to EMA 200 (long-term trend)
+    df["price_to_ema200"] = df["close"] / df["ema_200"] - 1
+
+    # Trend direction: 1 = bull, 0 = bear
+    df["trend_bull"] = (df["close"] > df["ema_200"]).astype(int)
+
+    # EMA alignment (stronger trend signal)
+    # Bull: EMA12 > EMA26 > EMA50 > EMA200
+    df["ema_alignment_bull"] = (
+        (df["ema_12"] > df["ema_26"]) &
+        (df["ema_26"] > df["ema_50"]) &
+        (df["ema_50"] > df["ema_200"])
+    ).astype(int)
+
+    # Bear: EMA12 < EMA26 < EMA50 < EMA200
+    df["ema_alignment_bear"] = (
+        (df["ema_12"] < df["ema_26"]) &
+        (df["ema_26"] < df["ema_50"]) &
+        (df["ema_50"] < df["ema_200"])
+    ).astype(int)
+
+    # Trend strength (distance from EMA200, normalized by ATR)
+    df["trend_strength"] = (df["close"] - df["ema_200"]) / df["atr_14"]
+    df["trend_strength"] = df["trend_strength"].clip(-10, 10)  # Clip extremes
+
+    # Market regime: 1 = strong bull, 0.5 = weak bull, -0.5 = weak bear, -1 = strong bear
+    conditions = [
+        df["ema_alignment_bull"] == 1,  # Strong bull
+        df["trend_bull"] == 1,           # Weak bull
+        df["ema_alignment_bear"] == 1,  # Strong bear
+    ]
+    choices = [1.0, 0.5, -1.0]
+    df["market_regime"] = np.select(conditions, choices, default=-0.5)
+
+    # Trend momentum (rate of change of EMA50)
+    df["trend_momentum"] = df["ema_50"].pct_change(periods=10) * 100
+    df["trend_momentum"] = df["trend_momentum"].clip(-5, 5)
+
+    # Higher timeframe trend (20-period slope of EMA50)
+    df["ema50_slope"] = (df["ema_50"] - df["ema_50"].shift(20)) / df["ema_50"].shift(20) * 100
+    df["ema50_slope"] = df["ema50_slope"].clip(-10, 10)
+
     return df
 
 
 def prepare_features(df: pd.DataFrame, feature_columns: list = None) -> pd.DataFrame:
     if feature_columns is None:
         feature_columns = [
+            # Price data
             "open", "high", "low", "close", "volume",
-            "rsi_14", "ema_12", "ema_26", "macd", "macd_signal",
-            "bb_upper", "bb_middle", "bb_lower", "atr_14", "adx_14",
-            "stoch_k", "stoch_d", "roc_10", "cci_20",
-            "returns", "volatility", "price_to_ema12", "ema_trend"
+            # Momentum indicators
+            "rsi_14", "macd", "macd_signal", "stoch_k", "stoch_d", "roc_10", "cci_20",
+            # Volatility
+            "bb_upper", "bb_middle", "bb_lower", "atr_14", "volatility",
+            # Trend indicators
+            "adx_14", "ema_trend", "returns",
+            # Price relative to EMAs
+            "price_to_ema12", "price_to_ema26", "price_to_ema50", "price_to_ema200",
+            # TREND FILTER - Bull/Bear detection (NEW)
+            "trend_bull", "ema_alignment_bull", "ema_alignment_bear",
+            "trend_strength", "market_regime", "trend_momentum", "ema50_slope"
         ]
     
     feature_columns = [col for col in feature_columns if col in df.columns]
