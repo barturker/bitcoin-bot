@@ -358,4 +358,15 @@ def evaluate_model(model, env, name: str = ""):
 
 
 if __name__ == "__main__":
-    train()
+    try:
+        train()
+    except Exception as e:
+        import traceback
+        print("\n" + "=" * 70)
+        print("  ERROR OCCURRED!")
+        print("=" * 70)
+        traceback.print_exc()
+        print("=" * 70)
+    finally:
+        print("\nPress Enter to close...")
+        input()
