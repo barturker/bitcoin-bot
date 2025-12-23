@@ -7,20 +7,42 @@ Multi-source sentiment analizi sistemi. Birden fazla LLM ve veri kaynağı kulla
 
 ## API Keys (Toplanacak)
 
+### Zorunlu (Ücretsiz)
+- [ ] **Binance** - https://www.binance.com/en/my/settings/api-management
 - [ ] **Groq** - https://console.groq.com
 - [ ] **Google Gemini** - https://aistudio.google.com
 - [ ] **HuggingFace** - https://huggingface.co/settings/tokens
 - [ ] **CryptoPanic** - https://cryptopanic.com/developers/api
-- [ ] **Binance** - https://www.binance.com/en/my/settings/api-management
+
+### Whale & On-Chain (Ücretsiz)
+- [ ] **Whale Alert** - https://whale-alert.io/api (ücretsiz tier)
+- [ ] **Glassnode** - https://studio.glassnode.com/ (bazı metrikler ücretsiz)
+- [ ] **Blockchain.com** - API key gerekmiyor
+
+### Sosyal Medya (Opsiyonel)
+- [ ] **Reddit** - https://www.reddit.com/prefs/apps (PRAW için)
+- [ ] **Twitter/X** - Paralı, alternatif: Nitter scraping
 
 `.env` dosyasına eklenecek:
 ```
+# Binance
 BINANCE_API_KEY=
 BINANCE_API_SECRET=
+
+# LLM APIs
 GROQ_API_KEY=
 GOOGLE_AI_API_KEY=
 HUGGINGFACE_API_KEY=
+
+# Data Sources
 CRYPTOPANIC_API_KEY=
+WHALE_ALERT_API_KEY=
+REDDIT_CLIENT_ID=
+REDDIT_CLIENT_SECRET=
+
+# Alerts (Opsiyonel)
+TELEGRAM_BOT_TOKEN=
+DISCORD_WEBHOOK_URL=
 ```
 
 ---
@@ -44,6 +66,38 @@ CRYPTOPANIC_API_KEY=
 ### 4. Reddit
 - r/bitcoin, r/cryptocurrency
 - PRAW kütüphanesi ile
+
+### 5. Whale Alert (YENİ)
+- https://whale-alert.io/
+- Büyük BTC transferlerini takip
+- Exchange'e giriş = satış sinyali
+- Exchange'den çıkış = HODL sinyali
+- Ücretsiz API mevcut
+
+### 6. On-Chain Data (YENİ)
+- Glassnode (bazı metrikler ücretsiz)
+- Exchange inflow/outflow
+- Active addresses
+- MVRV ratio
+
+### 7. Ünlü İsimler Twitter Takibi (YENİ)
+Takip edilecek hesaplar:
+- @elonmusk - Elon Musk (büyük etki)
+- @saborlorsaylor - Michael Saylor (Bitcoin maximalist)
+- @VitalikButerin - Vitalik (Ethereum ama crypto genel)
+- @caborlosz - CZ Binance
+- @brian_armstrong - Coinbase CEO
+- @APompliano - Anthony Pompliano
+- Scraping: Nitter veya Twitter API
+
+### 8. Whale Wallet Tracking (YENİ)
+Takip edilecek cüzdanlar:
+- Satoshi cüzdanları (hareket ederse büyük haber)
+- MicroStrategy cüzdanı
+- Tesla cüzdanı
+- Büyük exchange cold wallet'ları
+- Top 100 BTC holder adresleri
+- Kaynak: Blockchain.com, Bitinfocharts
 
 ---
 
@@ -69,32 +123,49 @@ CRYPTOPANIC_API_KEY=
 ## Sistem Mimarisi
 
 ```
-┌─────────────────── VERİ KAYNAKLARI ───────────────────┐
-│                                                        │
-│  CryptoPanic API ──► Haberler (son 1 saat)            │
-│  Fear & Greed    ──► Index değeri                     │
-│  Reddit PRAW     ──► Top posts sentiment              │
-│                                                        │
-└────────────────────────┬───────────────────────────────┘
-                         ▼
-┌─────────────────── LLM ANALİZ ────────────────────────┐
-│                                                        │
-│  Groq (Llama 3.1)    ──► sentiment_1 (-1 to +1)       │
-│  Google Gemini       ──► sentiment_2 (-1 to +1)       │
-│  FinBERT             ──► sentiment_3 (-1 to +1)       │
-│                                                        │
-└────────────────────────┬───────────────────────────────┘
-                         ▼
-┌─────────────────── BİRLEŞTİRME ───────────────────────┐
-│                                                        │
-│  weighted_sentiment = 0.4*s1 + 0.35*s2 + 0.25*s3      │
-│  confidence = std_dev(sentiments) # düşük = hemfikir  │
-│                                                        │
-│  Çıktı: sentiment (-1 to +1), confidence (0 to 1)     │
-│                                                        │
-└────────────────────────┬───────────────────────────────┘
-                         ▼
-                [Trading Model Input]
+┌──────────────────────── VERİ KAYNAKLARI ────────────────────────┐
+│                                                                  │
+│  ┌─── HABERLER ───┐  ┌─── SOSYAL ───┐  ┌─── ON-CHAIN ───┐      │
+│  │ CryptoPanic    │  │ Twitter      │  │ Whale Alert    │      │
+│  │ Fear & Greed   │  │ Reddit       │  │ Exchange Flow  │      │
+│  │ Google News    │  │ Ünlü İsimler │  │ Whale Wallets  │      │
+│  └────────────────┘  └──────────────┘  └────────────────┘      │
+│                                                                  │
+└─────────────────────────────┬────────────────────────────────────┘
+                              ▼
+┌──────────────────────── LLM ANALİZ ─────────────────────────────┐
+│                                                                  │
+│  Groq (Llama 3.1)    ──► news_sentiment                         │
+│  Google Gemini       ──► social_sentiment                       │
+│  FinBERT             ──► financial_sentiment                    │
+│                                                                  │
+└─────────────────────────────┬────────────────────────────────────┘
+                              ▼
+┌──────────────────────── WHALE SİNYALLERİ ───────────────────────┐
+│                                                                  │
+│  Exchange'e büyük giriş (>1000 BTC)  ──► SATIŞ sinyali 🔴       │
+│  Exchange'den büyük çıkış            ──► HODL sinyali 🟢        │
+│  Ünlü cüzdan hareketi                ──► ALERT! ⚠️              │
+│  Elon tweet                          ──► Anlık analiz 🐦        │
+│                                                                  │
+└─────────────────────────────┬────────────────────────────────────┘
+                              ▼
+┌──────────────────────── BİRLEŞTİRME ────────────────────────────┐
+│                                                                  │
+│  final_sentiment = weighted_average(all_sources)                │
+│  whale_signal = analyze_whale_activity()                        │
+│  vip_signal = check_vip_tweets()                                │
+│  confidence = model_agreement_score()                           │
+│                                                                  │
+│  Çıktı:                                                         │
+│  - sentiment: -1 (bearish) to +1 (bullish)                      │
+│  - whale_signal: -1 (selling) to +1 (accumulating)              │
+│  - vip_alert: bool (ünlü biri tweet attı mı?)                   │
+│  - confidence: 0 to 1                                           │
+│                                                                  │
+└─────────────────────────────┬────────────────────────────────────┘
+                              ▼
+                     [Trading Model Input]
 ```
 
 ---
@@ -105,9 +176,11 @@ CRYPTOPANIC_API_KEY=
 src/
 ├── sentiment/
 │   ├── __init__.py
-│   ├── data_sources.py      # CryptoPanic, Fear&Greed, Reddit
+│   ├── news_sources.py      # CryptoPanic, Fear&Greed, Google News
+│   ├── social_sources.py    # Twitter, Reddit, Ünlü isimler
+│   ├── whale_tracker.py     # Whale Alert, Exchange flow, Wallet tracking
 │   ├── llm_analyzers.py     # Groq, Gemini, FinBERT
-│   ├── aggregator.py        # Sentimentleri birleştir
+│   ├── aggregator.py        # Tüm sinyalleri birleştir
 │   └── sentiment_engine.py  # Ana modül
 ├── paper_trading.py         # Paper trading sistemi
 └── live_trading.py          # Canlı trading (ileride)
@@ -122,26 +195,40 @@ src/
 - [ ] API bağlantı testleri
 - [ ] Rate limit yönetimi
 
-### Faz 2: Veri Kaynakları
+### Faz 2: Haber Kaynakları
 - [ ] CryptoPanic entegrasyonu
 - [ ] Fear & Greed Index entegrasyonu
-- [ ] Reddit PRAW entegrasyonu
+- [ ] Google News crypto haberleri
 
-### Faz 3: LLM Entegrasyonu
+### Faz 3: Sosyal Medya
+- [ ] Reddit PRAW entegrasyonu
+- [ ] Twitter/Nitter scraping
+- [ ] Ünlü isim listesi ve takip sistemi
+
+### Faz 4: Whale Tracking (YENİ)
+- [ ] Whale Alert API entegrasyonu
+- [ ] Exchange inflow/outflow takibi
+- [ ] Ünlü cüzdan adresleri listesi
+- [ ] Büyük transfer alert sistemi
+
+### Faz 5: LLM Entegrasyonu
 - [ ] Groq client
 - [ ] Gemini client
 - [ ] FinBERT (HuggingFace)
 - [ ] Prompt engineering (sentiment analizi için)
 
-### Faz 4: Birleştirme
+### Faz 6: Birleştirme
 - [ ] Weighted average hesaplama
+- [ ] Whale signal scoring
+- [ ] VIP tweet alert sistemi
 - [ ] Confidence score
 - [ ] Fallback mekanizması (API çökerse)
 
-### Faz 5: Trading Entegrasyonu
-- [ ] Sentiment'i model input'una ekle
+### Faz 7: Trading Entegrasyonu
+- [ ] Tüm sinyalleri model input'una ekle
 - [ ] Paper trading'de test et
-- [ ] Dashboard'a sentiment göstergesi ekle
+- [ ] Dashboard'a sentiment + whale göstergesi ekle
+- [ ] Real-time alert sistemi (Telegram/Discord)
 
 ---
 
