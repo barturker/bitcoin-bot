@@ -283,6 +283,62 @@ def add_market_regime_flags(df: pd.DataFrame) -> pd.DataFrame:
         0
     ).astype(np.float32)
 
+    # ============ BULL vs BEAR TREND (CRITICAL for 2020/2022) ============
+    # Separate bull and bear trends - model must learn to AVOID bear trends
+
+    # Bull trend: price above EMAs + EMAs aligned upward + DI+ > DI-
+    df['regime_bull_trend'] = (
+        (df['adx_14'] > 25) &  # Trending
+        (df['close'] > df['ema_50']) &  # Price above EMA50
+        (df['ema_50'] > df['ema_200']) &  # EMA50 above EMA200
+        (df['di_plus'] > df['di_minus'])  # Bullish direction
+    ).astype(np.float32)
+
+    # Bear trend: price below EMAs + EMAs aligned downward + DI- > DI+
+    df['regime_bear_trend'] = (
+        (df['adx_14'] > 25) &  # Trending
+        (df['close'] < df['ema_50']) &  # Price below EMA50
+        (df['ema_50'] < df['ema_200']) &  # EMA50 below EMA200
+        (df['di_minus'] > df['di_plus'])  # Bearish direction
+    ).astype(np.float32)
+
+    # ============ SHOCK / CRISIS DETECTION (COVID, Black Swan) ============
+    # Detect extreme market conditions where NO trading is safe
+    window = min(168, max(24, len(df) // 4))
+
+    # ATR spike: current ATR in top 5% of recent history
+    atr_spike_pct = df['atr_14'].rolling(window=window, min_periods=24).apply(
+        lambda x: (x.iloc[-1] > x).mean(), raw=False
+    ).fillna(0.5)
+    df['regime_atr_spike'] = (atr_spike_pct > 0.95).astype(np.float32)
+
+    # Large candle bodies (panic selling/buying)
+    body_size = np.abs(df['close'] - df['open']) / df['close'] * 100
+    body_pct = body_size.rolling(window=window, min_periods=24).apply(
+        lambda x: (x.iloc[-1] > x).mean(), raw=False
+    ).fillna(0.5)
+    df['regime_large_candles'] = (body_pct > 0.95).astype(np.float32)
+
+    # Volume spike
+    volume_pct = df['volume'].rolling(window=window, min_periods=24).apply(
+        lambda x: (x.iloc[-1] > x).mean(), raw=False
+    ).fillna(0.5)
+    df['regime_volume_spike'] = (volume_pct > 0.95).astype(np.float32)
+
+    # SHOCK regime: multiple crisis indicators
+    df['regime_shock'] = (
+        (df['regime_atr_spike'] == 1) &
+        ((df['regime_large_candles'] == 1) | (df['regime_volume_spike'] == 1))
+    ).astype(np.float32)
+
+    # ============ NO TRADE ZONE (HARD VETO) ============
+    # Conditions where gatekeeper MUST stay silent
+    df['regime_no_trade_zone'] = (
+        (df['regime_shock'] == 1) |  # Crisis/crash
+        (df['regime_bear_trend'] == 1) |  # Bear market
+        ((df['regime_high_volatility'] == 1) & (df['regime_ranging'] == 1))  # Volatile chop
+    ).astype(np.float32)
+
     # ============ VOLATILITY REGIME ============
     # ATR percentile over rolling window (168 = 1 week for 1h data)
     window = min(168, max(24, len(df) // 4))
@@ -340,12 +396,13 @@ def add_market_regime_flags(df: pd.DataFrame) -> pd.DataFrame:
     df['regime_trend_conflict'] = df['trend_conflict'].astype(np.float32)
 
     # ============ COMPOSITE RISK FLAGS ============
-    # Ideal setup: ALL conditions favorable
+    # Ideal setup: BULL TREND + ALL conditions favorable
     df['regime_ideal_setup'] = (
-        (df['regime_trending'] == 1) &
+        (df['regime_bull_trend'] == 1) &  # Must be BULL, not just trending
         (df['regime_trend_conflict'] == 0) &
-        ((df['regime_htf_bullish'] == 1) | (df['regime_htf_bearish'] == 1)) &
-        (df['regime_normal_volatility'] == 1)
+        (df['regime_htf_bullish'] == 1) &  # HTF must also be bullish
+        (df['regime_normal_volatility'] == 1) &
+        (df['regime_shock'] == 0)  # No crisis
     ).astype(np.float32)
 
     # Chop zone: ranging + BB squeeze (AVOID trading)
@@ -354,37 +411,45 @@ def add_market_regime_flags(df: pd.DataFrame) -> pd.DataFrame:
         (df['regime_bb_squeeze'] == 1)
     ).astype(np.float32)
 
-    # Dangerous conditions: conflict OR (high vol + ranging)
+    # Dangerous conditions: conflict OR (high vol + ranging) OR shock
     df['regime_dangerous'] = (
         (df['regime_trend_conflict'] == 1) |
-        ((df['regime_high_volatility'] == 1) & (df['regime_ranging'] == 1))
+        ((df['regime_high_volatility'] == 1) & (df['regime_ranging'] == 1)) |
+        (df['regime_shock'] == 1)
     ).astype(np.float32)
 
-    # Caution: weak trend OR extreme RSI without HTF support
+    # Caution: weak trend OR extreme RSI without HTF support OR bear trend
     df['regime_caution'] = (
         (df['regime_weak_trend'] == 1) |
+        (df['regime_bear_trend'] == 1) |  # Bear trend = caution
         (((df['regime_overbought'] == 1) | (df['regime_oversold'] == 1)) &
          (df['regime_htf_neutral'] == 1))
     ).astype(np.float32)
 
     # ============ COMPOSITE QUALITY SCORE ============
     # Pre-computed quality for reward calculation
+    # CRITICAL: Bear trend and shock get MASSIVE penalties
     quality = np.zeros(len(df), dtype=np.float32)
 
-    # Positive contributions
-    quality += df['regime_trending'].values * 0.20
+    # Positive contributions (only for BULL conditions)
+    quality += df['regime_bull_trend'].values * 0.30  # Bull trend is key
     quality += df['regime_strong_trend'].values * 0.10
-    quality += df['regime_full_confluence'].values * 0.25
+    quality += df['regime_full_confluence'].values * 0.20
     quality += df['regime_normal_volatility'].values * 0.10
     quality += df['regime_strong_momentum'].values * 0.05
-    quality += df['regime_trend_clarity'].values * 0.10
+    quality += df['regime_trend_clarity'].values * 0.05
+    quality += df['regime_htf_bullish'].values * 0.10
 
     # Negative contributions
-    quality -= df['regime_ranging'].values * 0.25
-    quality -= df['regime_trend_conflict'].values * 0.40
+    quality -= df['regime_ranging'].values * 0.20
+    quality -= df['regime_trend_conflict'].values * 0.30
     quality -= df['regime_chop'].values * 0.20
-    quality -= df['regime_dangerous'].values * 0.15
     quality -= df['regime_bb_squeeze'].values * 0.05
+
+    # MASSIVE penalties for bear/shock (model must learn to STAY OUT)
+    quality -= df['regime_bear_trend'].values * 0.60  # Bear trend = very bad
+    quality -= df['regime_shock'].values * 0.80  # Shock = worst
+    quality -= df['regime_no_trade_zone'].values * 0.50  # No trade zone
 
     df['regime_quality_score'] = quality.clip(-1, 1)
 
@@ -422,6 +487,11 @@ def prepare_features(df: pd.DataFrame, feature_columns: list = None) -> pd.DataF
             # Trend regime
             "regime_trending", "regime_strong_trend", "regime_ranging",
             "regime_weak_trend", "regime_trend_clarity",
+            # BULL vs BEAR trend (CRITICAL for 2020/2022)
+            "regime_bull_trend", "regime_bear_trend",
+            # Shock/Crisis detection
+            "regime_atr_spike", "regime_large_candles", "regime_volume_spike",
+            "regime_shock", "regime_no_trade_zone",
             # Volatility regime
             "regime_volatility_pct", "regime_low_volatility",
             "regime_high_volatility", "regime_normal_volatility", "regime_bb_squeeze",

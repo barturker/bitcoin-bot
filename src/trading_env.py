@@ -469,26 +469,48 @@ class BitcoinTradingEnv(gym.Env):
         """
         Calculate immediate reward for the decision itself.
         This teaches the model WHEN to trade.
+
+        V2.2: Added massive penalties for trading in bear/shock conditions.
         """
         reward = 0.0
+        current = self.feature_df.iloc[self.current_step]
+
+        # Check for NO TRADE ZONE (bear trend, shock, volatile chop)
+        is_no_trade_zone = current.get('regime_no_trade_zone', 0) > 0.5
+        is_bear_trend = current.get('regime_bear_trend', 0) > 0.5
+        is_shock = current.get('regime_shock', 0) > 0.5
 
         # Action: NO_TRADE (0)
         if action == 0:
-            if market_quality < self.QUALITY_THRESHOLD or htf_bias == 0:
-                # Correct decision: Didn't trade in bad conditions
-                reward = 0.1 * (1 - market_quality)  # More reward for avoiding worse conditions
+            if is_no_trade_zone:
+                # EXCELLENT: Stayed out of danger zone
+                reward = 0.3  # Big reward for avoiding bear/shock
                 self.decisions['correct_no_trade'] += 1
-            elif market_quality > 0.3 and htf_bias != 0:
-                # Missed opportunity (but small penalty - being conservative is OK)
-                reward = -0.05
+            elif market_quality < self.QUALITY_THRESHOLD or htf_bias == 0:
+                # Correct decision: Didn't trade in bad conditions
+                reward = 0.1 * (1 - market_quality)
+                self.decisions['correct_no_trade'] += 1
+            elif market_quality > 0.3 and htf_bias != 0 and not is_bear_trend:
+                # Missed opportunity (but only penalize in bull conditions)
+                reward = -0.03  # Reduced penalty - being conservative is OK
                 self.decisions['wrong_no_trade'] += 1
 
         # Action: TRADE (1)
         elif action == 1:
             if not self._can_trade():
-                # Tried to trade when not allowed - no immediate penalty
-                # (the lack of position is punishment enough)
                 pass
+            elif is_shock:
+                # TERRIBLE: Trading during crisis - MASSIVE penalty
+                reward = -0.5
+                self.decisions['wrong_trade'] += 1
+            elif is_bear_trend:
+                # VERY BAD: Trading in bear market
+                reward = -0.4
+                self.decisions['wrong_trade'] += 1
+            elif is_no_trade_zone:
+                # BAD: Trading in no-trade zone
+                reward = -0.3
+                self.decisions['wrong_trade'] += 1
             elif htf_bias == 0:
                 # Tried to trade with no bias - BAD
                 reward = -0.2
@@ -499,7 +521,6 @@ class BitcoinTradingEnv(gym.Env):
                 self.decisions['wrong_trade'] += 1
             else:
                 # Trading in good conditions with bias - potentially good
-                # Final verdict comes from outcome reward
                 reward = 0.05 * market_quality
                 self.decisions['correct_trade'] += 1
 
