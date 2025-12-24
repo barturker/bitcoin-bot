@@ -1,50 +1,61 @@
-# Bitcoin Trading Bot - Model Documentation (V2.2 - Gatekeeper)
+# Bitcoin Trading Bot - Model Documentation (V2.3 - Gatekeeper)
 
-> **Version 2.2** - Added bear/shock regime detection to avoid trading in dangerous market conditions
+> **Version 2.3** - HARD VETO system: dangerous conditions now OVERRIDE RL decisions completely
 
 ## Executive Summary
 
-| Aspect | V1 (Old) | V2.0 | V2.1 | V2.2 (Current) |
-|--------|----------|------|------|----------------|
-| RL Role | Full trader | Gatekeeper | Gatekeeper | Gatekeeper |
-| Action Space | 5 actions | 2 actions | 2 actions | 2 actions |
-| Direction | RL chooses | Rule-based (HTF) | Rule-based (HTF) | Rule-based (HTF) |
-| SL/TP | RL chooses | Fixed (2%/4%) | Fixed (2%/4%) | Fixed (2%/4%) |
-| Market Quality | N/A | Single scalar [-1,1] | 25 decomposed flags | **32 decomposed flags** |
-| RL Sees | Raw features | Raw + quality | Explicit regime flags | **Bear/Shock detection** |
-| Lucky Wins | Rewarded | Penalized | Penalized | Penalized |
-| Bear Market | No handling | No handling | No handling | **MASSIVE PENALTY** |
+| Aspect | V1 (Old) | V2.0 | V2.1 | V2.2 | V2.3 (Current) |
+|--------|----------|------|------|------|----------------|
+| RL Role | Full trader | Gatekeeper | Gatekeeper | Gatekeeper | **Constrained Gatekeeper** |
+| Action Space | 5 actions | 2 actions | 2 actions | 2 actions | 2 actions |
+| Direction | RL chooses | Rule-based | Rule-based | Rule-based | Rule-based |
+| SL/TP | RL chooses | Fixed 2%/4% | Fixed 2%/4% | Fixed 2%/4% | Fixed 2%/4% |
+| Danger Handling | None | None | Flags only | Penalties | **HARD VETO** |
+| Trade Frequency | Unlimited | 3/day | 3/day | 3/day | **1/day + 24h cooldown** |
+| RL Freedom | Full | High | High | Medium | **Low (allowed zones only)** |
 
-### V2.2 Key Improvement
+### V2.3 Key Improvement: HARD VETO
 
-Walk-forward validation revealed the model loses in bear markets (2020: -15.8%, 2022: -21.4%).
-The problem: Model knew "is there a trend?" but not "is this trend tradeable?"
+V2.2 tried to teach RL to avoid danger with penalties. **It didn't work** - model still lost in bear markets.
 
-**Solution:** Added explicit bear/shock detection with massive penalties:
-- `regime_bull_trend` - Uptrend with price above EMAs and DI+ > DI-
-- `regime_bear_trend` - Downtrend with price below EMAs and DI- > DI+
-- `regime_shock` - Crisis detection (ATR spike + volume spike/large candles)
-- `regime_no_trade_zone` - Hard veto combining bear + shock + dangerous conditions
+**V2.3 Solution:** Don't ask RL in dangerous conditions. **FORCE NO_TRADE.**
 
-**Goal:** Model learns "bear market = stay silent" rather than trying to profit from shorts
+```python
+HARD_VETO_FLAGS = [
+    'regime_bear_trend',      # Bear market = NO TRADE
+    'regime_shock',           # Crisis = NO TRADE
+    'regime_trend_conflict',  # TFs disagree = NO TRADE
+    'regime_chop',            # Range + squeeze = NO TRADE
+    'regime_no_trade_zone',   # Composite danger = NO TRADE
+]
+
+# If ANY flag is active → RL decision is OVERRIDDEN → Forced NO_TRADE
+```
+
+**Philosophy change:**
+- V2.2: "Let RL learn from penalties in dangerous conditions"
+- V2.3: "RL is NOT ALLOWED to trade in dangerous conditions"
+
+> **"Edge is thin. Thin edge needs hard rules."**
 
 ---
 
 ## Table of Contents
 1. [Core Philosophy](#core-philosophy)
 2. [Architecture](#architecture)
-3. [Action Space](#action-space)
-4. [HTF Bias (Rule-Based Direction)](#htf-bias-rule-based-direction)
-5. [Reward System](#reward-system)
-6. [Market Quality Assessment](#market-quality-assessment)
-7. [Market Regime Flags](#market-regime-flags)
-8. [Bear/Shock Detection (V2.2)](#bearshock-detection-v22)
-9. [Trade Frequency Control](#trade-frequency-control)
-10. [Walk-Forward Validation](#walk-forward-validation)
-11. [Feature Engineering](#feature-engineering)
-12. [Configuration](#configuration)
-13. [Key Design Decisions](#key-design-decisions)
-14. [Metrics to Monitor](#metrics-to-monitor)
+3. [HARD VETO System (V2.3)](#hard-veto-system-v23)
+4. [Action Space](#action-space)
+5. [HTF Bias (Rule-Based Direction)](#htf-bias-rule-based-direction)
+6. [Reward System](#reward-system)
+7. [Market Quality Assessment](#market-quality-assessment)
+8. [Market Regime Flags](#market-regime-flags)
+9. [Bear/Shock Detection (V2.2)](#bearshock-detection-v22)
+10. [Trade Frequency Control](#trade-frequency-control)
+11. [Walk-Forward Validation](#walk-forward-validation)
+12. [Feature Engineering](#feature-engineering)
+13. [Configuration](#configuration)
+14. [Key Design Decisions](#key-design-decisions)
+15. [Metrics to Monitor](#metrics-to-monitor)
 
 ---
 
@@ -84,7 +95,7 @@ Everything else is rule-based:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                   V2.1 GATEKEEPER ARCHITECTURE                       │
+│                   V2.3 GATEKEEPER ARCHITECTURE                       │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  ┌──────────────┐                                                   │
@@ -96,41 +107,43 @@ Everything else is rule-based:
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐   │
 │  │  Indicators  │───►│   Features   │───►│   REGIME FLAGS       │   │
 │  │  (1H + MTF)  │    │ (Normalized) │    │   (NOT Normalized)   │   │
-│  └──────────────┘    └──────────────┘    │                      │   │
-│                                          │  • Trend (5 flags)   │   │
-│                                          │  • Volatility (5)    │   │
-│                                          │  • Momentum (6)      │   │
-│                                          │  • HTF Align (5)     │   │
-│                                          │  • Risk (4)          │   │
-│                                          │  • Quality Score     │   │
+│  └──────────────┘    └──────────────┘    │  • 32 flags total    │   │
+│                                          │  • Includes VETO     │   │
+│                                          │    flags (V2.3)      │   │
 │                                          └──────────┬───────────┘   │
 │                                                     │               │
-│         ┌───────────────────┬───────────────────────┤               │
-│         ▼                   ▼                       ▼               │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
-│  │ HTF Bias     │    │   Quality    │    │     RL       │          │
-│  │ (Rule-Based) │    │   Score      │    │   Agent      │          │
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘          │
-│         │                   │                   │                   │
-│         │  LONG/SHORT/      │  regime_quality   │  TRADE/          │
-│         │     NONE          │    _score         │  NO_TRADE        │
-│         │                   │                   │                   │
-│         └─────────┬─────────┴─────────┬─────────┘                   │
-│                   │                   │                              │
-│                   ▼                   ▼                              │
+│  ╔══════════════════════════════════════════════════╧═══════════╗   │
+│  ║                    HARD VETO LAYER (V2.3)                    ║   │
+│  ║  ┌─────────────────────────────────────────────────────────┐ ║   │
+│  ║  │  IF any VETO flag active:                               │ ║   │
+│  ║  │    • regime_bear_trend                                  │ ║   │
+│  ║  │    • regime_shock                                       │ ║   │
+│  ║  │    • regime_trend_conflict                              │ ║   │
+│  ║  │    • regime_chop                                        │ ║   │
+│  ║  │    • regime_no_trade_zone                               │ ║   │
+│  ║  │  THEN: FORCE action = NO_TRADE (RL bypassed)            │ ║   │
+│  ║  └─────────────────────────────────────────────────────────┘ ║   │
+│  ╚══════════════════════════════════════════════════════════════╝   │
+│                                   │                                  │
+│         ┌─────────────────────────┼─────────────────────────┐       │
+│         ▼                         ▼                         ▼       │
+│  ┌──────────────┐    ┌──────────────────────┐    ┌──────────────┐   │
+│  │ HTF Bias     │    │   FREQUENCY LIMIT    │    │     RL       │   │
+│  │ (Rule-Based) │    │   (V2.3)             │    │   Agent      │   │
+│  └──────┬───────┘    │  • 1 trade/day max   │    │ (only in     │   │
+│         │            │  • 24h cooldown      │    │ ALLOWED zone)│   │
+│         │            └──────────┬───────────┘    └──────┬───────┘   │
+│         │                       │                       │           │
+│         └─────────┬─────────────┴─────────┬─────────────┘           │
+│                   │                       │                          │
+│                   ▼                       ▼                          │
 │            ┌──────────────────────────────┐                          │
 │            │      TRADE EXECUTION         │                          │
-│            │  (Only if bias != NONE       │                          │
-│            │   AND action == TRADE)       │                          │
-│            └──────────────────────────────┘                          │
-│                          │                                           │
-│                          ▼                                           │
-│            ┌──────────────────────────────┐                          │
-│            │     POSITION MANAGEMENT      │                          │
-│            │  - Fixed SL: 2%              │                          │
-│            │  - Fixed TP: 4%              │                          │
-│            │  - Max Duration: 72h         │                          │
-│            │  - NO manual close by RL     │                          │
+│            │  (Only if:                   │                          │
+│            │   • NO veto active           │                          │
+│            │   • bias != NONE             │                          │
+│            │   • action == TRADE          │                          │
+│            │   • cooldown passed)         │                          │
 │            └──────────────────────────────┘                          │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -151,6 +164,78 @@ src/
 config.yaml             # V2 Configuration
 MODEL_DOCUMENTATION.md  # This file
 ```
+
+---
+
+## HARD VETO System (V2.3)
+
+### Why Hard Veto?
+
+V2.2 results showed that **penalties don't work** for teaching RL to avoid danger:
+
+| Version | Approach | Result |
+|---------|----------|--------|
+| V2.1 | Regime flags as features | Model ignores them |
+| V2.2 | Massive penalties (-0.5) | Model still trades in bear, loses |
+| **V2.3** | **HARD VETO (override RL)** | **RL cannot trade in danger** |
+
+### The Insight
+
+> **"If RL keeps making the same mistake despite penalties,
+> remove the possibility of making that mistake."**
+
+### Veto Flags
+
+These 5 flags trigger absolute prohibition:
+
+| Flag | Condition | Why Veto |
+|------|-----------|----------|
+| `regime_bear_trend` | ADX>25 + price<EMA50<EMA200 + DI->DI+ | Bear markets kill accounts |
+| `regime_shock` | ATR spike + volume/candle spike | Crisis = unpredictable |
+| `regime_trend_conflict` | 1H vs Daily disagree | No edge when TFs fight |
+| `regime_chop` | Ranging + BB squeeze | Whipsaw city |
+| `regime_no_trade_zone` | Composite of above | Multiple dangers |
+
+### Implementation
+
+```python
+def _is_hard_veto(self) -> Tuple[bool, str]:
+    """Check if ANY hard veto flag is active."""
+    current = self.feature_df.iloc[self.current_step]
+
+    for flag in self.HARD_VETO_FLAGS:
+        if current.get(flag, 0) > 0.5:
+            return True, flag.replace('regime_', '')
+
+    return False, ''
+
+def step(self, action):
+    # Check HARD VETO before anything else
+    is_vetoed, veto_reason = self._is_hard_veto()
+
+    if is_vetoed and action == 1:
+        # RL wanted to trade but we're vetoing it
+        reward += 0.15  # Teach RL this is correct
+        action = 0  # FORCE NO_TRADE
+        self.decisions['hard_vetoes'] += 1
+```
+
+### Veto Statistics
+
+Walk-forward now reports `hard_vetoes` count per fold:
+- High veto count in bear years (2020, 2022) = **system working correctly**
+- Low veto count in bull years = **RL has room to trade**
+
+### What RL Learns
+
+With hard veto, RL training becomes:
+1. **Dangerous conditions:** RL cannot trade → learns "these states = no opportunity"
+2. **Allowed conditions:** RL makes real decisions → learns actual edge
+
+This is cleaner than penalties because:
+- No gradient noise from impossible actions
+- RL focuses on learnable patterns only
+- Faster convergence in allowed zones
 
 ---
 
@@ -604,11 +689,21 @@ def _calculate_decision_reward(action):
 
 ## Trade Frequency Control
 
+### V2.3: Brutal Limits
+
+Walk-forward analysis showed model was **overtrading** (100-240 trades per year).
+Quality > Quantity.
+
+| Version | Max Trades/Day | Cooldown | Result |
+|---------|----------------|----------|--------|
+| V2.0-2.2 | 3 | 2 hours | Too many trades, losses accumulate |
+| **V2.3** | **1** | **24 hours** | Forced selectivity |
+
 ### Limits
 
 ```python
-max_trades_per_day = 3  # Maximum 3 trades per 24 hours
-min_cooldown = 2        # Minimum 2 hours between trades
+max_trades_per_day = 1   # Maximum 1 trade per 24 hours (V2.3)
+min_cooldown = 24        # Minimum 24 hours between trades (V2.3)
 ```
 
 ### `_can_trade()` Check
@@ -619,25 +714,32 @@ def _can_trade(self) -> bool:
     if self.position is not None:
         return False
 
+    # V2.3: HARD VETO - absolute prohibition
+    is_vetoed, _ = self._is_hard_veto()
+    if is_vetoed:
+        return False
+
     # Daily limit reached
     if self.daily_trade_count >= self.max_trades_per_day:
         return False
 
-    # Cooldown not passed
-    if self.current_step - self.last_trade_step < 2:
+    # V2.3: Minimum cooldown between trades (24 hours)
+    if self.current_step - self.last_trade_step < 24:
         return False
 
     return True
 ```
 
-### Frequency Penalty
+### Expected Trade Frequency
 
-```python
-def _calculate_frequency_penalty(self) -> float:
-    if daily_trade_count > max_trades_per_day * 0.7:
-        return -0.05 * (daily_trade_count / max_trades_per_day)
-    return 0.0
-```
+With 1/day limit + 24h cooldown + hard veto:
+
+| Market Condition | Expected Trades/Month |
+|------------------|----------------------|
+| Bull market | 15-20 (good setups exist) |
+| Sideways | 5-10 (fewer opportunities) |
+| Bear market | 0-2 (mostly vetoed) |
+| Crisis (shock) | 0 (hard veto blocks all) |
 
 ---
 
@@ -785,7 +887,7 @@ trading:
   tp_pct: 0.04       # 4% (R:R = 1:2)
   spread_pct: 0.001
   commission_pct: 0.001
-  max_trades_per_day: 3
+  max_trades_per_day: 1  # V2.3: Brutal limit
 
 model:
   algorithm: "PPO"
@@ -879,7 +981,7 @@ reward:
 
 ## Decision Statistics
 
-V2 tracks detailed decision quality:
+V2.3 tracks detailed decision quality including hard vetoes:
 
 ```python
 decisions = {
@@ -888,6 +990,7 @@ decisions = {
     'wrong_no_trade': 0,      # Missed good opportunity
     'wrong_trade': 0,         # Traded in bad conditions
     'lucky_wins': 0,          # Profit despite bad entry
+    'hard_vetoes': 0,         # V2.3: Times RL was overridden
 }
 ```
 
@@ -895,7 +998,16 @@ Access with:
 ```python
 stats = env.get_decision_stats()
 print(f"Correct rate: {stats['correct_rate']*100:.1f}%")
+print(f"Hard vetoes: {stats['hard_vetoes']}")  # V2.3
 ```
+
+### Interpreting Hard Vetoes
+
+| Veto Count | Interpretation |
+|------------|----------------|
+| High (1000+) | Bear/crisis period, system protecting capital |
+| Medium (100-500) | Mixed conditions, some danger zones |
+| Low (<100) | Bull market, RL has room to trade |
 
 ---
 
@@ -906,7 +1018,51 @@ print(f"Correct rate: {stats['correct_rate']*100:.1f}%")
 | 1.0 | - | Basic RL, 5-action space, PnL rewards |
 | 2.0 | Dec 2024 | Gatekeeper model, 2 actions, quality rewards, walk-forward |
 | 2.1 | Dec 2024 | Decomposed market regime flags (25 flags), interpretable quality |
-| **2.2** | **Dec 2024** | **Bear/shock detection (32 flags), massive penalties for danger zones** |
+| 2.2 | Dec 2024 | Bear/shock detection (32 flags), massive penalties for danger zones |
+| **2.3** | **Dec 2024** | **HARD VETO system, 1 trade/day limit, 24h cooldown** |
+
+### V2.3 Changelog
+
+**Problem Identified:**
+V2.2 penalties didn't work. Model still lost in bear markets:
+- Profitable folds dropped from 57% (V2.1) to 14% (V2.2)
+- 2021 bull year: -25% (should have been profitable!)
+- Model was confused by conflicting signals
+
+**Root Cause:** Penalties teach RL "this is bad" but RL still tries. Need to **remove the option entirely**.
+
+**Solution: HARD VETO**
+- 5 veto flags that OVERRIDE RL decisions completely
+- If ANY veto flag active → action FORCED to NO_TRADE
+- RL only operates in "allowed zones"
+
+**New Features:**
+- `_is_hard_veto()` method checks 5 danger flags
+- `HARD_VETO_FLAGS` class constant defines veto conditions
+- `hard_vetoes` counter tracks overridden decisions
+- Brutal frequency limits: 1 trade/day, 24h cooldown
+- Simplified decision reward (no danger handling needed)
+
+**Veto Flags:**
+```python
+HARD_VETO_FLAGS = [
+    'regime_bear_trend',
+    'regime_shock',
+    'regime_trend_conflict',
+    'regime_chop',
+    'regime_no_trade_zone',
+]
+```
+
+**Expected Impact:**
+- Bear years (2020, 2022): Near-zero trades (vetoed)
+- Bull years: Selective trades in allowed zones only
+- Model learns actual edge, not noise
+
+**Files Modified:**
+- `src/trading_env.py` - Added hard veto system, frequency limits
+- `src/walk_forward.py` - Reports hard_vetoes per fold
+- `config.yaml` - max_trades_per_day: 1
 
 ### V2.2 Changelog
 
