@@ -331,17 +331,8 @@ def add_market_regime_flags(df: pd.DataFrame) -> pd.DataFrame:
         ((df['regime_large_candles'] == 1) | (df['regime_volume_spike'] == 1))
     ).astype(np.float32)
 
-    # ============ NO TRADE ZONE (HARD VETO) ============
-    # Conditions where gatekeeper MUST stay silent
-    df['regime_no_trade_zone'] = (
-        (df['regime_shock'] == 1) |  # Crisis/crash
-        (df['regime_bear_trend'] == 1) |  # Bear market
-        ((df['regime_high_volatility'] == 1) & (df['regime_ranging'] == 1))  # Volatile chop
-    ).astype(np.float32)
-
     # ============ VOLATILITY REGIME ============
     # ATR percentile over rolling window (168 = 1 week for 1h data)
-    window = min(168, max(24, len(df) // 4))
     atr_pct = df['atr_14'].rolling(window=window, min_periods=24).apply(
         lambda x: (x.iloc[-1] > x).mean(), raw=False
     ).fillna(0.5)
@@ -358,6 +349,15 @@ def add_market_regime_flags(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: (x.iloc[-1] > x).mean(), raw=False
     ).fillna(0.5)
     df['regime_bb_squeeze'] = (bb_width_pct < 0.2).astype(np.float32)
+
+    # ============ NO TRADE ZONE (HARD VETO) ============
+    # Conditions where gatekeeper MUST stay silent
+    # Now defined after high_volatility and ranging are available
+    df['regime_no_trade_zone'] = (
+        (df['regime_shock'] == 1) |  # Crisis/crash
+        (df['regime_bear_trend'] == 1) |  # Bear market
+        ((df['regime_high_volatility'] == 1) & (df['regime_ranging'] == 1))  # Volatile chop
+    ).astype(np.float32)
 
     # ============ MOMENTUM REGIME ============
     df['regime_overbought'] = (df['rsi_14'] > 70).astype(np.float32)
