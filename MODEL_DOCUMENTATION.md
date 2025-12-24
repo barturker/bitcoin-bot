@@ -1,25 +1,32 @@
-# Bitcoin Trading Bot - Model Documentation (V2.1 - Gatekeeper)
+# Bitcoin Trading Bot - Model Documentation (V2.2 - Gatekeeper)
 
-> **Version 2.1** - Added decomposed market regime flags for interpretable quality assessment
+> **Version 2.2** - Added bear/shock regime detection to avoid trading in dangerous market conditions
 
 ## Executive Summary
 
-| Aspect | V1 (Old) | V2.0 | V2.1 (Current) |
-|--------|----------|------|----------------|
-| RL Role | Full trader | Gatekeeper | Gatekeeper |
-| Action Space | 5 actions | 2 actions | 2 actions |
-| Direction | RL chooses | Rule-based (HTF) | Rule-based (HTF) |
-| SL/TP | RL chooses | Fixed (2%/4%) | Fixed (2%/4%) |
-| Market Quality | N/A | Single scalar [-1,1] | **25 decomposed flags** |
-| RL Sees | Raw features | Raw + quality | **Explicit regime flags** |
-| Lucky Wins | Rewarded | Penalized | Penalized |
+| Aspect | V1 (Old) | V2.0 | V2.1 | V2.2 (Current) |
+|--------|----------|------|------|----------------|
+| RL Role | Full trader | Gatekeeper | Gatekeeper | Gatekeeper |
+| Action Space | 5 actions | 2 actions | 2 actions | 2 actions |
+| Direction | RL chooses | Rule-based (HTF) | Rule-based (HTF) | Rule-based (HTF) |
+| SL/TP | RL chooses | Fixed (2%/4%) | Fixed (2%/4%) | Fixed (2%/4%) |
+| Market Quality | N/A | Single scalar [-1,1] | 25 decomposed flags | **32 decomposed flags** |
+| RL Sees | Raw features | Raw + quality | Explicit regime flags | **Bear/Shock detection** |
+| Lucky Wins | Rewarded | Penalized | Penalized | Penalized |
+| Bear Market | No handling | No handling | No handling | **MASSIVE PENALTY** |
 
-### V2.1 Key Improvement
+### V2.2 Key Improvement
 
-The single `market_quality` scalar has been **decomposed into 25 explicit regime flags**:
-- RL now sees WHY conditions are good/bad, not just a score
-- Flags remain unnormalized (0/1 values) for interpretability
-- Pre-computed quality score available for reward calculation
+Walk-forward validation revealed the model loses in bear markets (2020: -15.8%, 2022: -21.4%).
+The problem: Model knew "is there a trend?" but not "is this trend tradeable?"
+
+**Solution:** Added explicit bear/shock detection with massive penalties:
+- `regime_bull_trend` - Uptrend with price above EMAs and DI+ > DI-
+- `regime_bear_trend` - Downtrend with price below EMAs and DI- > DI+
+- `regime_shock` - Crisis detection (ATR spike + volume spike/large candles)
+- `regime_no_trade_zone` - Hard veto combining bear + shock + dangerous conditions
+
+**Goal:** Model learns "bear market = stay silent" rather than trying to profit from shorts
 
 ---
 
@@ -30,13 +37,14 @@ The single `market_quality` scalar has been **decomposed into 25 explicit regime
 4. [HTF Bias (Rule-Based Direction)](#htf-bias-rule-based-direction)
 5. [Reward System](#reward-system)
 6. [Market Quality Assessment](#market-quality-assessment)
-7. [Market Regime Flags (V2.1)](#market-regime-flags-v21)
-8. [Trade Frequency Control](#trade-frequency-control)
-9. [Walk-Forward Validation](#walk-forward-validation)
-10. [Feature Engineering](#feature-engineering)
-11. [Configuration](#configuration)
-12. [Key Design Decisions](#key-design-decisions)
-13. [Metrics to Monitor](#metrics-to-monitor)
+7. [Market Regime Flags](#market-regime-flags)
+8. [Bear/Shock Detection (V2.2)](#bearshock-detection-v22)
+9. [Trade Frequency Control](#trade-frequency-control)
+10. [Walk-Forward Validation](#walk-forward-validation)
+11. [Feature Engineering](#feature-engineering)
+12. [Configuration](#configuration)
+13. [Key Design Decisions](#key-design-decisions)
+14. [Metrics to Monitor](#metrics-to-monitor)
 
 ---
 
@@ -230,9 +238,13 @@ Given at the moment of decision:
 |----------|--------|-------------|
 | NO_TRADE when bad conditions | +0.1 × (1 - quality) | Correct patience |
 | NO_TRADE when good opportunity | -0.05 | Missed opportunity |
+| NO_TRADE in danger zone (V2.2) | **+0.3** | **Excellent patience** |
 | TRADE with no bias | -0.2 | Wrong decision |
 | TRADE in bad quality | -0.15 × |quality| | Wrong decision |
 | TRADE in good conditions | +0.05 × quality | Potentially good |
+| **TRADE during shock (V2.2)** | **-0.5** | **TERRIBLE decision** |
+| **TRADE in bear trend (V2.2)** | **-0.4** | **Very bad decision** |
+| **TRADE in no_trade_zone (V2.2)** | **-0.3** | **Bad decision** |
 
 #### Part 2: Outcome Reward (Trade Close)
 
@@ -353,7 +365,7 @@ print(info['quality_components']['chop'])  # 0.0 or 1.0
 
 ---
 
-## Market Regime Flags (V2.1)
+## Market Regime Flags
 
 ### The Problem with Single Scalar Quality
 
@@ -364,7 +376,7 @@ In V2.0, market quality was a single number [-1, +1]. This had issues:
 
 ### The Solution: Decomposed Regime Flags
 
-V2.1 introduces **25 explicit regime flags** that:
+V2.1 introduced **25 explicit regime flags**, V2.2 expanded to **32 flags** that:
 - Use RAW indicator values with meaningful TA thresholds
 - Remain as 0/1 values (NOT normalized)
 - Give RL explicit signals it can learn to interpret
@@ -421,6 +433,23 @@ V2.1 introduces **25 explicit regime flags** that:
 | `regime_dangerous` | conflict OR (high vol + ranging) | **HIGH RISK** |
 | `regime_caution` | weak trend OR extreme RSI + neutral HTF | Be careful |
 
+#### 6. Shock/Crisis Detection (V2.2 - 3 flags)
+
+| Flag | Condition | Meaning |
+|------|-----------|---------|
+| `regime_atr_spike` | ATR > 2× median | Abnormal volatility |
+| `regime_volume_spike` | Volume > 3× mean | Panic volume |
+| `regime_large_candles` | Candle size > 3× ATR | Extreme price movement |
+
+#### 7. Bear/Bull Trend Direction (V2.2 - 4 flags)
+
+| Flag | Condition | Meaning |
+|------|-----------|---------|
+| `regime_bull_trend` | ADX>25 + price>EMA50>EMA200 + DI+>DI- | **SAFE TO LONG** |
+| `regime_bear_trend` | ADX>25 + price<EMA50<EMA200 + DI->DI+ | **AVOID TRADING** |
+| `regime_shock` | ATR spike + (volume spike OR large candles) | **CRISIS - DO NOT TRADE** |
+| `regime_no_trade_zone` | shock OR bear_trend OR (high_vol + ranging) | **HARD VETO** |
+
 ### Normalization Behavior
 
 ```python
@@ -443,6 +472,133 @@ elif components['trend_conflict'] == 1.0:
 elif components['trending'] == 1.0 and components['htf_bullish'] == 1.0:
     print("Good conditions for long")
 ```
+
+---
+
+## Bear/Shock Detection (V2.2)
+
+### The Problem: Bear Market Losses
+
+Walk-forward validation revealed a critical issue:
+
+| Validation Year | Return | Issue |
+|-----------------|--------|-------|
+| 2017 | +12.5% | Bull market ✓ |
+| 2018 | -3.2% | Bear, some losses |
+| 2019 | +8.4% | Sideways, OK |
+| **2020** | **-15.8%** | **COVID crash** |
+| 2021 | +15.2% | Bull ✓ |
+| **2022** | **-21.4%** | **Bear market** |
+| 2023 | +5.1% | Recovery |
+
+The model knew "is there a trend?" but NOT "is this trend tradeable (bullish)?"
+
+### The Solution: Bull vs Bear Separation
+
+**Previous (V2.1):**
+```python
+regime_trending = ADX > 25  # "There is a trend" (but which direction?)
+```
+
+**New (V2.2):**
+```python
+# BULL trend: safe to trade
+regime_bull_trend = (
+    (ADX > 25) &
+    (close > EMA_50) &
+    (EMA_50 > EMA_200) &
+    (DI+ > DI-)
+)
+
+# BEAR trend: AVOID trading
+regime_bear_trend = (
+    (ADX > 25) &
+    (close < EMA_50) &
+    (EMA_50 < EMA_200) &
+    (DI- > DI+)
+)
+```
+
+### Shock Detection
+
+Crisis conditions (COVID crash, flash crashes):
+
+```python
+# ATR spike: volatility > 2x normal
+regime_atr_spike = ATR > (2 × rolling_median_ATR)
+
+# Volume spike: panic selling/buying
+regime_volume_spike = Volume > (3 × rolling_mean_volume)
+
+# Large candles: extreme moves
+regime_large_candles = |high - low| > (3 × ATR)
+
+# SHOCK = multiple crisis indicators
+regime_shock = regime_atr_spike & (regime_volume_spike | regime_large_candles)
+```
+
+### No Trade Zone (Hard Veto)
+
+```python
+regime_no_trade_zone = (
+    regime_shock |           # Crisis
+    regime_bear_trend |      # Bear market
+    (regime_high_volatility & regime_ranging)  # Chaos
+)
+```
+
+### Quality Score Impact (V2.2)
+
+```python
+# MASSIVE penalties for dangerous conditions
+quality -= regime_bear_trend * 0.60      # Bear = -60% quality
+quality -= regime_shock * 0.80           # Shock = -80% quality
+quality -= regime_no_trade_zone * 0.50   # No-trade = -50% quality
+quality -= regime_atr_spike * 0.15       # ATR spike penalty
+quality -= regime_volume_spike * 0.10    # Volume spike penalty
+quality -= regime_large_candles * 0.10   # Large candles penalty
+```
+
+### Reward Penalties (V2.2)
+
+```python
+def _calculate_decision_reward(action):
+    # Check danger flags
+    is_shock = components.get('shock', 0) == 1
+    is_bear_trend = components.get('bear_trend', 0) == 1
+    is_no_trade_zone = components.get('no_trade_zone', 0) == 1
+
+    if action == TRADE:
+        if is_shock:
+            return -0.5  # TERRIBLE: Trading during crisis
+        elif is_bear_trend:
+            return -0.4  # VERY BAD: Trading in bear market
+        elif is_no_trade_zone:
+            return -0.3  # BAD: Trading in no-trade zone
+
+    elif action == NO_TRADE:
+        if is_shock or is_bear_trend or is_no_trade_zone:
+            return +0.3  # EXCELLENT: Staying out of danger
+```
+
+### Expected Behavior
+
+| Market Condition | V2.1 Behavior | V2.2 Behavior |
+|------------------|---------------|---------------|
+| 2020 COVID crash | Tries to short, loses | Detects shock, stays out |
+| 2022 bear market | Tries to short, loses | Detects bear_trend, stays out |
+| Bull market dip | May enter too early | Waits for bull_trend to return |
+| Flash crash | Gets stopped out | Shock detection prevents entry |
+
+### Why Not Just Trade Bear Trends?
+
+**Problem with shorting bear markets:**
+1. **Retail platforms** often have poor short execution
+2. **Bear rallies** are violent and unpredictable
+3. **Timing** bear market entries is extremely difficult
+4. **Model learned** on more bull data (Bitcoin's history)
+
+**Better strategy:** Sit out bear markets entirely, preserve capital for bull runs.
 
 ---
 
@@ -538,14 +694,14 @@ Output:
 
 ## Feature Engineering
 
-### Total Features: 73 (V2.1)
+### Total Features: 80 (V2.2)
 
 | Category | Count | Normalized |
 |----------|-------|------------|
 | Base Indicators (1H) | 28 | Yes |
 | Multi-Timeframe (4H + Daily) | 16 | Yes |
 | Confluence Signals | 5 | Yes |
-| **Regime Flags (V2.1)** | **25** | **No** |
+| **Regime Flags (V2.2)** | **32** | **No** |
 | Position Features | 4 | Mixed |
 
 #### Base Indicators (1H) - Normalized
@@ -566,8 +722,8 @@ Output:
 - `htf_bias` (directional bias)
 - `trend_conflict` (warning signal)
 
-#### Regime Flags (V2.1) - NOT Normalized
-These 25 flags remain as raw 0/1 values:
+#### Regime Flags (V2.2) - NOT Normalized
+These 32 flags remain as raw 0/1 values:
 
 ```
 Trend:      regime_trending, regime_strong_trend, regime_ranging,
@@ -586,6 +742,12 @@ HTF:        regime_htf_bullish, regime_htf_bearish, regime_htf_neutral,
 
 Risk:       regime_ideal_setup, regime_chop, regime_dangerous,
             regime_caution
+
+Shock:      regime_atr_spike, regime_volume_spike, regime_large_candles
+(V2.2)
+
+Direction:  regime_bull_trend, regime_bear_trend, regime_shock,
+(V2.2)      regime_no_trade_zone
 
 Score:      regime_quality_score
 ```
@@ -743,7 +905,36 @@ print(f"Correct rate: {stats['correct_rate']*100:.1f}%")
 |---------|------|---------|
 | 1.0 | - | Basic RL, 5-action space, PnL rewards |
 | 2.0 | Dec 2024 | Gatekeeper model, 2 actions, quality rewards, walk-forward |
-| 2.1 | Dec 2024 | **Decomposed market regime flags** (25 flags), interpretable quality |
+| 2.1 | Dec 2024 | Decomposed market regime flags (25 flags), interpretable quality |
+| **2.2** | **Dec 2024** | **Bear/shock detection (32 flags), massive penalties for danger zones** |
+
+### V2.2 Changelog
+
+**Problem Identified:**
+Walk-forward validation showed model losing in bear markets:
+- 2020 (COVID): -15.8%
+- 2022 (Bear): -21.4%
+
+Root cause: Model knew "is there a trend?" but not "is this trend safe to trade?"
+
+**New Features:**
+- `regime_bull_trend` - Uptrend detection (safe to trade)
+- `regime_bear_trend` - Downtrend detection (AVOID)
+- `regime_shock` - Crisis detection (COVID crashes, flash crashes)
+- `regime_no_trade_zone` - Hard veto combining all danger signals
+- `regime_atr_spike`, `regime_volume_spike`, `regime_large_candles` - Crisis indicators
+- Massive quality penalties: bear=-60%, shock=-80%, no_trade=-50%
+- Reward penalties: trading in shock=-0.5, bear=-0.4, no_trade=-0.3
+- Reward bonus: NOT trading in danger=+0.3
+
+**Expected Impact:**
+- Model learns "bear market = stay silent"
+- Preserves capital during crashes
+- Focuses on bull market opportunities
+
+**Files Modified:**
+- `src/indicators.py` - Added 7 new regime flags, updated quality calculation
+- `src/trading_env.py` - Added danger zone penalties in reward system
 
 ### V2.1 Changelog
 
@@ -757,7 +948,7 @@ print(f"Correct rate: {stats['correct_rate']*100:.1f}%")
 
 **Breaking Changes:**
 - Old scalers are incompatible (will show warning, need retraining)
-- Observation space size increased (48 → 73 features + position)
+- Observation space size increased (48 → 80 features + position)
 
 **Files Modified:**
 - `src/indicators.py` - Added regime flags calculation

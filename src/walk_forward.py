@@ -235,6 +235,7 @@ def evaluate_fold(
         'avg_pnl': avg_pnl,
         'lucky_win_rate': lucky_rate,
         'correct_rate': decision_stats.get('correct_rate', 0) * 100,
+        'hard_vetoes': decision_stats.get('hard_vetoes', 0),  # V2.3
         'total_reward': total_reward,
         'equity_curve': equity_curve
     }
@@ -308,7 +309,7 @@ def run_walk_forward(config_path: str = "config.yaml"):
         print(f"\n  {fold_name} Validation Results:")
         print(f"    Return: {result['total_return']:.2f}%")
         print(f"    Max DD: {result['max_drawdown']:.2f}%")
-        print(f"    Trades: {result['total_trades']}")
+        print(f"    Trades: {result['total_trades']} | Hard Vetoes: {result['hard_vetoes']}")
         print(f"    Win Rate: {result['win_rate']:.1f}%")
         print(f"    Lucky Win Rate: {result['lucky_win_rate']:.1f}%")
         print(f"    Correct Decision Rate: {result['correct_rate']:.1f}%")
@@ -324,7 +325,7 @@ def run_walk_forward(config_path: str = "config.yaml"):
     results_df = pd.DataFrame(all_results)
 
     print("\nPer-Fold Summary:")
-    print(results_df[['name', 'total_return', 'max_drawdown', 'total_trades', 'win_rate', 'lucky_win_rate']].to_string())
+    print(results_df[['name', 'total_return', 'max_drawdown', 'total_trades', 'hard_vetoes', 'win_rate']].to_string())
 
     print("\nAggregate Metrics:")
     print(f"  Mean Return: {results_df['total_return'].mean():.2f}%")
@@ -333,6 +334,7 @@ def run_walk_forward(config_path: str = "config.yaml"):
     print(f"  Mean Win Rate: {results_df['win_rate'].mean():.1f}%")
     print(f"  Mean Lucky Win Rate: {results_df['lucky_win_rate'].mean():.1f}%")
     print(f"  Mean Correct Decision Rate: {results_df['correct_rate'].mean():.1f}%")
+    print(f"  Total Hard Vetoes: {results_df['hard_vetoes'].sum():,}")
 
     # Profitable folds
     profitable = results_df[results_df['total_return'] > 0]

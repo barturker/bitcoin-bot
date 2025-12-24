@@ -43,6 +43,15 @@ class BitcoinTradingEnv(gym.Env):
     BIAS_THRESHOLD = 0.3  # Minimum MTF alignment for valid bias
     QUALITY_THRESHOLD = 0.0  # Minimum quality to consider trading
 
+    # V2.3: HARD VETO flags - These OVERRIDE RL completely
+    HARD_VETO_FLAGS = [
+        'regime_bear_trend',      # Bear market = NO TRADE
+        'regime_shock',           # Crisis = NO TRADE
+        'regime_trend_conflict',  # Timeframes disagree = NO TRADE
+        'regime_chop',            # Ranging + squeeze = NO TRADE
+        'regime_no_trade_zone',   # Composite danger = NO TRADE
+    ]
+
     def __init__(
         self,
         df: pd.DataFrame,
@@ -55,7 +64,7 @@ class BitcoinTradingEnv(gym.Env):
         spread_pct: float = 0.001,
         commission_pct: float = 0.001,
         max_position_pct: float = 0.20,
-        max_trades_per_day: int = 3,  # Trade frequency limit
+        max_trades_per_day: int = 1,  # V2.3: Brutal limit - max 1 trade/day
         render_mode: str = None
     ):
         super().__init__()
@@ -137,6 +146,7 @@ class BitcoinTradingEnv(gym.Env):
             'wrong_no_trade': 0,     # Missed good opportunity
             'wrong_trade': 0,        # Traded in bad conditions
             'lucky_wins': 0,         # Profit despite bad entry
+            'hard_vetoes': 0,        # V2.3: Times RL was overridden by veto
         }
 
         obs = self._get_observation()
@@ -260,18 +270,39 @@ class BitcoinTradingEnv(gym.Env):
 
         return components
 
+    def _is_hard_veto(self) -> Tuple[bool, str]:
+        """
+        V2.3: Check if ANY hard veto flag is active.
+        If yes, trading is FORBIDDEN regardless of what RL decides.
+
+        Returns:
+            (is_vetoed, veto_reason)
+        """
+        current = self.feature_df.iloc[self.current_step]
+
+        for flag in self.HARD_VETO_FLAGS:
+            if current.get(flag, 0) > 0.5:
+                return True, flag.replace('regime_', '')
+
+        return False, ''
+
     def _can_trade(self) -> bool:
-        """Check if trading is allowed (frequency limits, cooldown, etc.)."""
+        """Check if trading is allowed (frequency limits, cooldown, hard veto)."""
         # Already in position
         if self.position is not None:
+            return False
+
+        # V2.3: HARD VETO - absolute prohibition
+        is_vetoed, _ = self._is_hard_veto()
+        if is_vetoed:
             return False
 
         # Trade frequency limit
         if self.daily_trade_count >= self.max_trades_per_day:
             return False
 
-        # Minimum cooldown between trades (2 hours)
-        if self.current_step - self.last_trade_step < 2:
+        # V2.3: Minimum cooldown between trades (24 hours)
+        if self.current_step - self.last_trade_step < 24:
             return False
 
         return True
@@ -318,6 +349,7 @@ class BitcoinTradingEnv(gym.Env):
 
     def _get_info(self) -> dict:
         """Get additional info including decomposed quality components."""
+        is_vetoed, veto_reason = self._is_hard_veto()
         return {
             'capital': self.capital,
             'equity': self.equity,
@@ -330,6 +362,9 @@ class BitcoinTradingEnv(gym.Env):
             'htf_bias': self._get_htf_bias(),
             'daily_trade_count': self.daily_trade_count,
             'decisions': self.decisions.copy(),
+            # V2.3: Hard veto status
+            'is_vetoed': is_vetoed,
+            'veto_reason': veto_reason,
             # Decomposed quality components for analysis
             'quality_components': self._get_quality_components()
         }
@@ -470,58 +505,40 @@ class BitcoinTradingEnv(gym.Env):
         Calculate immediate reward for the decision itself.
         This teaches the model WHEN to trade.
 
-        V2.2: Added massive penalties for trading in bear/shock conditions.
+        V2.3: Simplified - dangerous conditions are handled by HARD VETO.
+        RL only sees allowed trading zones now.
         """
         reward = 0.0
-        current = self.feature_df.iloc[self.current_step]
 
-        # Check for NO TRADE ZONE (bear trend, shock, volatile chop)
-        is_no_trade_zone = current.get('regime_no_trade_zone', 0) > 0.5
-        is_bear_trend = current.get('regime_bear_trend', 0) > 0.5
-        is_shock = current.get('regime_shock', 0) > 0.5
+        # If we get here with action=1, hard veto didn't block it
+        # So we're in an "allowed" zone
 
         # Action: NO_TRADE (0)
         if action == 0:
-            if is_no_trade_zone:
-                # EXCELLENT: Stayed out of danger zone
-                reward = 0.3  # Big reward for avoiding bear/shock
-                self.decisions['correct_no_trade'] += 1
-            elif market_quality < self.QUALITY_THRESHOLD or htf_bias == 0:
-                # Correct decision: Didn't trade in bad conditions
+            if market_quality < self.QUALITY_THRESHOLD or htf_bias == 0:
+                # Correct: Didn't trade in bad/neutral conditions
                 reward = 0.1 * (1 - market_quality)
                 self.decisions['correct_no_trade'] += 1
-            elif market_quality > 0.3 and htf_bias != 0 and not is_bear_trend:
-                # Missed opportunity (but only penalize in bull conditions)
-                reward = -0.03  # Reduced penalty - being conservative is OK
+            elif market_quality > 0.3 and htf_bias != 0:
+                # Missed good opportunity in ALLOWED zone
+                reward = -0.05
                 self.decisions['wrong_no_trade'] += 1
 
         # Action: TRADE (1)
         elif action == 1:
             if not self._can_trade():
-                pass
-            elif is_shock:
-                # TERRIBLE: Trading during crisis - MASSIVE penalty
-                reward = -0.5
-                self.decisions['wrong_trade'] += 1
-            elif is_bear_trend:
-                # VERY BAD: Trading in bear market
-                reward = -0.4
-                self.decisions['wrong_trade'] += 1
-            elif is_no_trade_zone:
-                # BAD: Trading in no-trade zone
-                reward = -0.3
-                self.decisions['wrong_trade'] += 1
+                pass  # Can't trade (cooldown, etc.)
             elif htf_bias == 0:
-                # Tried to trade with no bias - BAD
-                reward = -0.2
+                # No bias = wrong decision
+                reward = -0.15
                 self.decisions['wrong_trade'] += 1
             elif market_quality < self.QUALITY_THRESHOLD:
-                # Trading in bad conditions - BAD
-                reward = -0.15 * abs(market_quality)
+                # Low quality setup
+                reward = -0.10 * abs(market_quality)
                 self.decisions['wrong_trade'] += 1
             else:
-                # Trading in good conditions with bias - potentially good
-                reward = 0.05 * market_quality
+                # Good conditions + bias = good trade attempt
+                reward = 0.1 * market_quality
                 self.decisions['correct_trade'] += 1
 
         return reward
@@ -594,6 +611,16 @@ class BitcoinTradingEnv(gym.Env):
         if hasattr(action, 'item'):
             action = action.item()
         action = int(action)
+
+        # V2.3: Check HARD VETO before anything else
+        is_vetoed, veto_reason = self._is_hard_veto()
+
+        if is_vetoed and action == 1:
+            # RL wanted to trade but we're vetoing it
+            # Give small positive reward to teach this is correct behavior
+            reward += 0.15  # "Good that you're learning, but this is forbidden"
+            action = 0  # FORCE NO_TRADE
+            self.decisions['hard_vetoes'] += 1
 
         # Get current market state
         market_quality = self._get_market_quality()
@@ -687,18 +714,27 @@ class BitcoinTradingEnv(gym.Env):
             htf_bias = self._get_htf_bias()
             bias_str = "LONG" if htf_bias > 0 else "SHORT" if htf_bias < 0 else "NONE"
             components = self._get_quality_components()
+            is_vetoed, veto_reason = self._is_hard_veto()
 
             print(f"Step: {self.current_step}")
             print(f"Capital: ${self.capital:.2f} | Equity: ${self.equity:.2f}")
             print(f"Position: {self.position} | HTF Bias: {bias_str}")
             print(f"Market Quality: {self._get_market_quality():.2f}")
 
+            # V2.3: Show VETO status prominently
+            if is_vetoed:
+                print(f">>> HARD VETO ACTIVE: {veto_reason.upper()} <<<")
+
             # Show key regime flags
             regime_flags = []
+            if components.get('bull_trend', 0) > 0.5:
+                regime_flags.append("BULL_TREND")
+            if components.get('bear_trend', 0) > 0.5:
+                regime_flags.append("BEAR_TREND!")
+            if components.get('shock', 0) > 0.5:
+                regime_flags.append("SHOCK!")
             if components.get('trending', 0) > 0.5:
                 regime_flags.append("TREND")
-            if components.get('strong_trend', 0) > 0.5:
-                regime_flags.append("STRONG")
             if components.get('ranging', 0) > 0.5:
                 regime_flags.append("RANGE")
             if components.get('htf_bullish', 0) > 0.5:
@@ -714,7 +750,7 @@ class BitcoinTradingEnv(gym.Env):
             print(f"Regime: [{' | '.join(regime_flags) if regime_flags else 'NEUTRAL'}]")
 
             print(f"Trades Today: {self.daily_trade_count}/{self.max_trades_per_day}")
-            print(f"Total Trades: {len(self.trades)}")
+            print(f"Total Trades: {len(self.trades)} | Hard Vetoes: {self.decisions['hard_vetoes']}")
             print("-" * 50)
 
 

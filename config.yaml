@@ -45,8 +45,8 @@ trading:
   spread_pct: 0.001         # 0.1% spread
   commission_pct: 0.001     # 0.1% commission
 
-  # Trade frequency limits (V2 - prevent overtrading)
-  max_trades_per_day: 3     # Max 3 trades per 24h
+  # Trade frequency limits (V2.3 - BRUTAL limits)
+  max_trades_per_day: 1     # Max 1 trade per 24h (hard rule)
 
 logging:
   tensorboard_log: "logs/tensorboard/"
