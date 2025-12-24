@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from indicators import (
     load_raw_data,
     resample_to_timeframe,
-    add_base_indicators,
+    add_technical_indicators,
     add_multi_timeframe_features,
     add_market_regime_flags,
     normalize_features
@@ -61,12 +61,12 @@ def prepare_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     """Prepare feature matrix from raw data."""
 
     # Add indicators
-    df = add_base_indicators(df)
+    df = add_technical_indicators(df)
     df = add_multi_timeframe_features(df)
     df = add_market_regime_flags(df)
 
     # Get feature columns (exclude OHLCV and target-like columns)
-    exclude_cols = ['open', 'high', 'low', 'close', 'volume', 'target']
+    exclude_cols = ['open', 'high', 'low', 'close', 'volume', 'target', 'year']
     feature_cols = [col for col in df.columns if col not in exclude_cols]
 
     return df, feature_cols
