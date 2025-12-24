@@ -1,18 +1,25 @@
-# Bitcoin Trading Bot - Model Documentation (V2 - Gatekeeper)
+# Bitcoin Trading Bot - Model Documentation (V2.1 - Gatekeeper)
 
-> **Version 2.0** - Complete refactor from "RL as Trader" to "RL as Gatekeeper"
+> **Version 2.1** - Added decomposed market regime flags for interpretable quality assessment
 
 ## Executive Summary
 
-| Aspect | V1 (Old) | V2 (Current) |
-|--------|----------|--------------|
-| RL Role | Full trader (direction + timing + exit) | Gatekeeper (only entry timing) |
-| Action Space | 5 actions | 2 actions (TRADE / NO_TRADE) |
-| Direction | RL chooses | Rule-based (HTF bias) |
-| SL/TP | RL chooses or fixed | Fixed (2% / 4%) |
-| Exit | RL can close manually | Mechanical only (SL/TP/timeout) |
-| Reward | PnL-centric | Quality-centric |
-| Lucky Wins | Rewarded | Penalized |
+| Aspect | V1 (Old) | V2.0 | V2.1 (Current) |
+|--------|----------|------|----------------|
+| RL Role | Full trader | Gatekeeper | Gatekeeper |
+| Action Space | 5 actions | 2 actions | 2 actions |
+| Direction | RL chooses | Rule-based (HTF) | Rule-based (HTF) |
+| SL/TP | RL chooses | Fixed (2%/4%) | Fixed (2%/4%) |
+| Market Quality | N/A | Single scalar [-1,1] | **25 decomposed flags** |
+| RL Sees | Raw features | Raw + quality | **Explicit regime flags** |
+| Lucky Wins | Rewarded | Penalized | Penalized |
+
+### V2.1 Key Improvement
+
+The single `market_quality` scalar has been **decomposed into 25 explicit regime flags**:
+- RL now sees WHY conditions are good/bad, not just a score
+- Flags remain unnormalized (0/1 values) for interpretability
+- Pre-computed quality score available for reward calculation
 
 ---
 
@@ -23,12 +30,13 @@
 4. [HTF Bias (Rule-Based Direction)](#htf-bias-rule-based-direction)
 5. [Reward System](#reward-system)
 6. [Market Quality Assessment](#market-quality-assessment)
-7. [Trade Frequency Control](#trade-frequency-control)
-8. [Walk-Forward Validation](#walk-forward-validation)
-9. [Feature Engineering](#feature-engineering)
-10. [Configuration](#configuration)
-11. [Key Design Decisions](#key-design-decisions)
-12. [Metrics to Monitor](#metrics-to-monitor)
+7. [Market Regime Flags (V2.1)](#market-regime-flags-v21)
+8. [Trade Frequency Control](#trade-frequency-control)
+9. [Walk-Forward Validation](#walk-forward-validation)
+10. [Feature Engineering](#feature-engineering)
+11. [Configuration](#configuration)
+12. [Key Design Decisions](#key-design-decisions)
+13. [Metrics to Monitor](#metrics-to-monitor)
 
 ---
 
@@ -67,51 +75,57 @@ Everything else is rule-based:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     V2 GATEKEEPER ARCHITECTURE                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐                                               │
-│  │  Market Data │                                               │
-│  │  (1H Candles)│                                               │
-│  └──────┬───────┘                                               │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌──────────────┐    ┌──────────────┐                           │
-│  │  Indicators  │───►│   Features   │                           │
-│  │  (1H + MTF)  │    │ (Normalized) │                           │
-│  └──────────────┘    └──────┬───────┘                           │
-│                             │                                    │
-│         ┌───────────────────┼───────────────────┐               │
-│         ▼                   ▼                   ▼               │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐       │
-│  │ HTF Bias     │    │   Market     │    │     RL       │       │
-│  │ (Rule-Based) │    │   Quality    │    │   Agent      │       │
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘       │
-│         │                   │                   │               │
-│         │    LONG/SHORT/    │   -1 to +1        │  TRADE/       │
-│         │       NONE        │                   │  NO_TRADE     │
-│         │                   │                   │               │
-│         └─────────┬─────────┴─────────┬─────────┘               │
-│                   │                   │                          │
-│                   ▼                   ▼                          │
-│            ┌──────────────────────────────┐                      │
-│            │      TRADE EXECUTION         │                      │
-│            │  (Only if bias != NONE       │                      │
-│            │   AND action == TRADE        │                      │
-│            │   AND quality allows)        │                      │
-│            └──────────────────────────────┘                      │
-│                          │                                       │
-│                          ▼                                       │
-│            ┌──────────────────────────────┐                      │
-│            │     POSITION MANAGEMENT      │                      │
-│            │  - Fixed SL: 2%              │                      │
-│            │  - Fixed TP: 4%              │                      │
-│            │  - Max Duration: 72h         │                      │
-│            │  - NO manual close by RL     │                      │
-│            └──────────────────────────────┘                      │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                   V2.1 GATEKEEPER ARCHITECTURE                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────┐                                                   │
+│  │  Market Data │                                                   │
+│  │  (1H Candles)│                                                   │
+│  └──────┬───────┘                                                   │
+│         │                                                            │
+│         ▼                                                            │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐   │
+│  │  Indicators  │───►│   Features   │───►│   REGIME FLAGS       │   │
+│  │  (1H + MTF)  │    │ (Normalized) │    │   (NOT Normalized)   │   │
+│  └──────────────┘    └──────────────┘    │                      │   │
+│                                          │  • Trend (5 flags)   │   │
+│                                          │  • Volatility (5)    │   │
+│                                          │  • Momentum (6)      │   │
+│                                          │  • HTF Align (5)     │   │
+│                                          │  • Risk (4)          │   │
+│                                          │  • Quality Score     │   │
+│                                          └──────────┬───────────┘   │
+│                                                     │               │
+│         ┌───────────────────┬───────────────────────┤               │
+│         ▼                   ▼                       ▼               │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
+│  │ HTF Bias     │    │   Quality    │    │     RL       │          │
+│  │ (Rule-Based) │    │   Score      │    │   Agent      │          │
+│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘          │
+│         │                   │                   │                   │
+│         │  LONG/SHORT/      │  regime_quality   │  TRADE/          │
+│         │     NONE          │    _score         │  NO_TRADE        │
+│         │                   │                   │                   │
+│         └─────────┬─────────┴─────────┬─────────┘                   │
+│                   │                   │                              │
+│                   ▼                   ▼                              │
+│            ┌──────────────────────────────┐                          │
+│            │      TRADE EXECUTION         │                          │
+│            │  (Only if bias != NONE       │                          │
+│            │   AND action == TRADE)       │                          │
+│            └──────────────────────────────┘                          │
+│                          │                                           │
+│                          ▼                                           │
+│            ┌──────────────────────────────┐                          │
+│            │     POSITION MANAGEMENT      │                          │
+│            │  - Fixed SL: 2%              │                          │
+│            │  - Fixed TP: 4%              │                          │
+│            │  - Max Duration: 72h         │                          │
+│            │  - NO manual close by RL     │                          │
+│            └──────────────────────────────┘                          │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### File Structure
@@ -272,43 +286,163 @@ reward_weights = {
 
 ## Market Quality Assessment
 
-### Scoring System
+### V2.1: Pre-Computed Quality Score
+
+In V2.1, the quality score is **pre-computed** in `indicators.py` using decomposed regime flags:
 
 ```python
 def _get_market_quality(self) -> float:
-    """Returns -1 (bad) to +1 (good)"""
-    quality = 0.0
+    """Returns pre-computed regime_quality_score from features."""
+    current_features = self.feature_df.iloc[self.current_step]
 
-    # 1. ADX (trend strength)
-    if adx > 0.5: quality += 0.25
-    elif adx < -0.5: quality -= 0.3
+    # Use pre-computed score (V2.1)
+    if 'regime_quality_score' in current_features.index:
+        return float(current_features['regime_quality_score'])
 
-    # 2. MTF alignment (most important)
-    quality += mtf_alignment * 0.4
+    # Fallback to old calculation for backward compatibility
+    # ... (legacy code)
+```
 
-    # 3. Strong confluence
-    if mtf_strong_bull or mtf_strong_bear:
-        quality += 0.2
+### Quality Score Calculation
 
-    # 4. Trend conflict penalty
-    if trend_conflict:
-        quality -= 0.3
+The `regime_quality_score` is computed from individual flags:
 
-    # 5. 4H ADX
-    if htf_4h_adx > 0.5: quality += 0.15
-    elif htf_4h_adx < -0.5: quality -= 0.15
+```python
+quality = 0.0
 
-    return clip(quality, -1, 1)
+# Positive contributions
+quality += regime_trending * 0.20        # Trending market
+quality += regime_strong_trend * 0.10    # Strong trend bonus
+quality += regime_full_confluence * 0.25 # All TFs agree
+quality += regime_normal_volatility * 0.10
+quality += regime_strong_momentum * 0.05
+quality += regime_trend_clarity * 0.10
+
+# Negative contributions
+quality -= regime_ranging * 0.25         # No trend
+quality -= regime_trend_conflict * 0.40  # TFs disagree (critical!)
+quality -= regime_chop * 0.20            # Ranging + squeeze
+quality -= regime_dangerous * 0.15       # High risk conditions
+quality -= regime_bb_squeeze * 0.05      # Consolidation
+
+return clip(quality, -1, 1)
 ```
 
 ### Quality Interpretation
 
-| Quality | Meaning | RL Should |
-|---------|---------|-----------|
-| > 0.5 | Excellent | Consider trading |
-| 0 to 0.5 | Acceptable | Trade with caution |
-| -0.5 to 0 | Poor | Probably wait |
-| < -0.5 | Dangerous | Definitely wait |
+| Quality | Meaning | RL Should | Example Flags |
+|---------|---------|-----------|---------------|
+| > 0.5 | Excellent | Trade | `ideal_setup=1`, `full_confluence=1` |
+| 0 to 0.5 | Acceptable | Consider | `trending=1`, `htf_bullish=1` |
+| -0.5 to 0 | Poor | Wait | `ranging=1`, `htf_neutral=1` |
+| < -0.5 | Dangerous | Avoid | `trend_conflict=1`, `chop=1` |
+
+### Accessing Quality Components
+
+```python
+# In trading_env.py
+components = env._get_quality_components()
+print(components)
+# {'trending': 1.0, 'ranging': 0.0, 'trend_conflict': 0.0,
+#  'ideal_setup': 1.0, 'quality_score': 0.65, ...}
+
+# In step info
+obs, reward, done, truncated, info = env.step(action)
+print(info['quality_components']['chop'])  # 0.0 or 1.0
+```
+
+---
+
+## Market Regime Flags (V2.1)
+
+### The Problem with Single Scalar Quality
+
+In V2.0, market quality was a single number [-1, +1]. This had issues:
+- Model couldn't distinguish WHY conditions were bad
+- Different failure modes (chop vs conflict) looked the same
+- No interpretability for debugging
+
+### The Solution: Decomposed Regime Flags
+
+V2.1 introduces **25 explicit regime flags** that:
+- Use RAW indicator values with meaningful TA thresholds
+- Remain as 0/1 values (NOT normalized)
+- Give RL explicit signals it can learn to interpret
+
+### Flag Categories
+
+#### 1. Trend Regime (5 flags)
+
+| Flag | Threshold | Meaning |
+|------|-----------|---------|
+| `regime_trending` | ADX > 25 | Market is trending |
+| `regime_strong_trend` | ADX > 40 | Strong trend |
+| `regime_ranging` | ADX < 20 | No trend (choppy) |
+| `regime_weak_trend` | ADX 20-25 | Weak/forming trend |
+| `regime_trend_clarity` | \|DI+ - DI-\| / sum | How clear is direction (0-1) |
+
+#### 2. Volatility Regime (5 flags)
+
+| Flag | Threshold | Meaning |
+|------|-----------|---------|
+| `regime_volatility_pct` | ATR percentile | Current vol vs history (0-1) |
+| `regime_low_volatility` | < 25th pct | Low volatility |
+| `regime_high_volatility` | > 75th pct | High volatility |
+| `regime_normal_volatility` | 25-75th pct | Normal volatility |
+| `regime_bb_squeeze` | BB width < 20th pct | Consolidation (breakout pending) |
+
+#### 3. Momentum Regime (6 flags)
+
+| Flag | Threshold | Meaning |
+|------|-----------|---------|
+| `regime_overbought` | RSI > 70 | Overbought |
+| `regime_oversold` | RSI < 30 | Oversold |
+| `regime_rsi_neutral` | RSI 40-60 | Neutral zone |
+| `regime_macd_bullish` | MACD hist > 0 | Bullish momentum |
+| `regime_macd_increasing` | MACD hist rising | Strengthening |
+| `regime_strong_momentum` | MACD > 70th pct | Strong momentum |
+
+#### 4. HTF Alignment (5 flags)
+
+| Flag | Threshold | Meaning |
+|------|-----------|---------|
+| `regime_htf_bullish` | MTF align > 0.5 | All TFs bullish |
+| `regime_htf_bearish` | MTF align < -0.5 | All TFs bearish |
+| `regime_htf_neutral` | MTF align in [-0.5, 0.5] | Mixed signals |
+| `regime_full_confluence` | All 3 TFs aligned | Strong confluence |
+| `regime_trend_conflict` | 1H vs Daily disagree | **CRITICAL WARNING** |
+
+#### 5. Composite Risk Flags (4 flags)
+
+| Flag | Condition | Meaning |
+|------|-----------|---------|
+| `regime_ideal_setup` | trending + no conflict + HTF aligned + normal vol | **BEST CONDITIONS** |
+| `regime_chop` | ranging + BB squeeze | **AVOID** |
+| `regime_dangerous` | conflict OR (high vol + ranging) | **HIGH RISK** |
+| `regime_caution` | weak trend OR extreme RSI + neutral HTF | Be careful |
+
+### Normalization Behavior
+
+```python
+# In normalize_features():
+skip_cols = [col for col in df.columns if col.startswith('regime_')]
+# These columns are NOT normalized - they stay as 0/1 values
+```
+
+### Example: Reading Market State
+
+```python
+components = env._get_quality_components()
+
+if components['ideal_setup'] == 1.0:
+    print("Perfect setup - all conditions favorable")
+elif components['chop'] == 1.0:
+    print("Chop zone - DO NOT TRADE")
+elif components['trend_conflict'] == 1.0:
+    print("Timeframes conflict - wait for alignment")
+elif components['trending'] == 1.0 and components['htf_bullish'] == 1.0:
+    print("Good conditions for long")
+```
 
 ---
 
@@ -404,25 +538,57 @@ Output:
 
 ## Feature Engineering
 
-### Total Features: 48
+### Total Features: 73 (V2.1)
 
-#### Base Indicators (1H)
+| Category | Count | Normalized |
+|----------|-------|------------|
+| Base Indicators (1H) | 28 | Yes |
+| Multi-Timeframe (4H + Daily) | 16 | Yes |
+| Confluence Signals | 5 | Yes |
+| **Regime Flags (V2.1)** | **25** | **No** |
+| Position Features | 4 | Mixed |
+
+#### Base Indicators (1H) - Normalized
 - Price: open, high, low, close, volume
 - Momentum: RSI, MACD, Stochastic, ROC, CCI
-- Volatility: BB, ATR, volatility
-- Trend: ADX, EMA alignment, regime
+- Volatility: BB (upper/middle/lower/width), ATR, volatility
+- Trend: ADX, DI+, DI-, EMA alignment, regime
 
-#### Multi-Timeframe (4H + Daily)
+#### Multi-Timeframe (4H + Daily) - Normalized
 - `htf_4h_trend` / `htf_1d_trend`
 - `htf_4h_rsi` / `htf_1d_rsi`
 - `htf_4h_adx` / `htf_1d_adx`
-- Price vs EMA21/50
+- Price vs EMA21/50/200
 
-#### Confluence Signals
+#### Confluence Signals - Normalized
 - `mtf_trend_alignment` (all TFs agree?)
 - `mtf_strong_bull` / `mtf_strong_bear`
 - `htf_bias` (directional bias)
 - `trend_conflict` (warning signal)
+
+#### Regime Flags (V2.1) - NOT Normalized
+These 25 flags remain as raw 0/1 values:
+
+```
+Trend:      regime_trending, regime_strong_trend, regime_ranging,
+            regime_weak_trend, regime_trend_clarity
+
+Volatility: regime_volatility_pct, regime_low_volatility,
+            regime_high_volatility, regime_normal_volatility,
+            regime_bb_squeeze
+
+Momentum:   regime_overbought, regime_oversold, regime_rsi_neutral,
+            regime_macd_bullish, regime_macd_increasing,
+            regime_strong_momentum
+
+HTF:        regime_htf_bullish, regime_htf_bearish, regime_htf_neutral,
+            regime_full_confluence, regime_trend_conflict
+
+Risk:       regime_ideal_setup, regime_chop, regime_dangerous,
+            regime_caution
+
+Score:      regime_quality_score
+```
 
 #### Position Features (added at runtime)
 - `position_type` (-1, 0, 1)
@@ -576,7 +742,26 @@ print(f"Correct rate: {stats['correct_rate']*100:.1f}%")
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | - | Basic RL, 5-action space, PnL rewards |
-| 2.0 | Current | Gatekeeper model, 2 actions, quality rewards, walk-forward |
+| 2.0 | Dec 2024 | Gatekeeper model, 2 actions, quality rewards, walk-forward |
+| 2.1 | Dec 2024 | **Decomposed market regime flags** (25 flags), interpretable quality |
+
+### V2.1 Changelog
+
+**New Features:**
+- Added `add_market_regime_flags()` function in `indicators.py`
+- 25 explicit regime flags with meaningful TA thresholds
+- Pre-computed `regime_quality_score` for reward calculation
+- Flags remain unnormalized (0/1) for interpretability
+- Added `_get_quality_components()` method for debugging
+- Updated `render()` to show active regime flags
+
+**Breaking Changes:**
+- Old scalers are incompatible (will show warning, need retraining)
+- Observation space size increased (48 → 73 features + position)
+
+**Files Modified:**
+- `src/indicators.py` - Added regime flags calculation
+- `src/trading_env.py` - Updated quality methods, render, info
 
 ---
 

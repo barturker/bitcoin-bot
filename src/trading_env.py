@@ -182,13 +182,26 @@ class BitcoinTradingEnv(gym.Env):
 
     def _get_market_quality(self) -> float:
         """
-        Assess current market quality for trading.
+        Get market quality score from pre-computed regime flags.
+
         Returns value between -1 (bad) and 1 (good).
+        Uses decomposed regime flags for interpretable quality assessment.
+
+        The quality score is pre-computed in indicators.py using:
+        - Trend regime (ADX-based)
+        - Volatility regime (ATR percentile)
+        - HTF alignment (multi-timeframe confluence)
+        - Risk flags (conflict, chop, dangerous conditions)
         """
         current_features = self.feature_df.iloc[self.current_step]
+
+        # Use pre-computed quality score if available (new system)
+        if 'regime_quality_score' in current_features.index:
+            return float(current_features['regime_quality_score'])
+
+        # Fallback to old calculation for backward compatibility
         quality = 0.0
 
-        # 1. ADX (trend strength)
         if 'adx_14' in current_features.index:
             adx = current_features['adx_14']
             if adx > 0.5:
@@ -196,24 +209,20 @@ class BitcoinTradingEnv(gym.Env):
             elif adx < -0.5:
                 quality -= 0.3
 
-        # 2. MTF alignment (most important)
         if 'mtf_trend_alignment' in current_features.index:
             mtf_align = current_features['mtf_trend_alignment']
             quality += mtf_align * 0.4
 
-        # 3. Strong confluence bonus
         if 'mtf_strong_bull' in current_features.index:
             if current_features['mtf_strong_bull'] > 0.5:
                 quality += 0.2
             elif current_features.get('mtf_strong_bear', 0) > 0.5:
                 quality += 0.2
 
-        # 4. Trend conflict penalty
         if 'trend_conflict' in current_features.index:
             if current_features['trend_conflict'] > 0.5:
                 quality -= 0.3
 
-        # 5. HTF ADX
         if 'htf_4h_adx' in current_features.index:
             htf_adx = current_features['htf_4h_adx']
             if htf_adx > 0.5:
@@ -222,6 +231,34 @@ class BitcoinTradingEnv(gym.Env):
                 quality -= 0.15
 
         return max(-1.0, min(1.0, quality))
+
+    def _get_quality_components(self) -> dict:
+        """
+        Get decomposed quality components for analysis and debugging.
+
+        Returns dict with individual regime flags and their current values.
+        This allows understanding WHY the quality score is what it is.
+
+        Categories returned:
+            - trend: trending, strong_trend, ranging, weak_trend, trend_clarity
+            - volatility: volatility_pct, low/high/normal, bb_squeeze
+            - momentum: overbought, oversold, macd_bullish, macd_increasing
+            - htf: htf_bullish, htf_bearish, htf_neutral, full_confluence
+            - risk: trend_conflict, ideal_setup, chop, dangerous, caution
+            - score: quality_score (composite)
+        """
+        current = self.feature_df.iloc[self.current_step]
+        components = {}
+
+        # Extract all regime flags
+        regime_cols = [col for col in current.index if col.startswith('regime_')]
+
+        for col in regime_cols:
+            # Remove 'regime_' prefix for cleaner keys
+            key = col.replace('regime_', '')
+            components[key] = float(current[col])
+
+        return components
 
     def _can_trade(self) -> bool:
         """Check if trading is allowed (frequency limits, cooldown, etc.)."""
@@ -280,7 +317,7 @@ class BitcoinTradingEnv(gym.Env):
         return obs
 
     def _get_info(self) -> dict:
-        """Get additional info."""
+        """Get additional info including decomposed quality components."""
         return {
             'capital': self.capital,
             'equity': self.equity,
@@ -292,7 +329,9 @@ class BitcoinTradingEnv(gym.Env):
             'market_quality': self._get_market_quality(),
             'htf_bias': self._get_htf_bias(),
             'daily_trade_count': self.daily_trade_count,
-            'decisions': self.decisions.copy()
+            'decisions': self.decisions.copy(),
+            # Decomposed quality components for analysis
+            'quality_components': self._get_quality_components()
         }
 
     def _get_current_price(self) -> float:
@@ -622,15 +661,37 @@ class BitcoinTradingEnv(gym.Env):
         return stats
 
     def render(self):
-        """Render the environment."""
+        """Render the environment with regime flags."""
         if self.render_mode == 'human':
             htf_bias = self._get_htf_bias()
             bias_str = "LONG" if htf_bias > 0 else "SHORT" if htf_bias < 0 else "NONE"
+            components = self._get_quality_components()
 
             print(f"Step: {self.current_step}")
             print(f"Capital: ${self.capital:.2f} | Equity: ${self.equity:.2f}")
             print(f"Position: {self.position} | HTF Bias: {bias_str}")
             print(f"Market Quality: {self._get_market_quality():.2f}")
+
+            # Show key regime flags
+            regime_flags = []
+            if components.get('trending', 0) > 0.5:
+                regime_flags.append("TREND")
+            if components.get('strong_trend', 0) > 0.5:
+                regime_flags.append("STRONG")
+            if components.get('ranging', 0) > 0.5:
+                regime_flags.append("RANGE")
+            if components.get('htf_bullish', 0) > 0.5:
+                regime_flags.append("HTF_BULL")
+            if components.get('htf_bearish', 0) > 0.5:
+                regime_flags.append("HTF_BEAR")
+            if components.get('trend_conflict', 0) > 0.5:
+                regime_flags.append("CONFLICT!")
+            if components.get('chop', 0) > 0.5:
+                regime_flags.append("CHOP!")
+            if components.get('ideal_setup', 0) > 0.5:
+                regime_flags.append("IDEAL*")
+            print(f"Regime: [{' | '.join(regime_flags) if regime_flags else 'NEUTRAL'}]")
+
             print(f"Trades Today: {self.daily_trade_count}/{self.max_trades_per_day}")
             print(f"Total Trades: {len(self.trades)}")
             print("-" * 50)
