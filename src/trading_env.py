@@ -1,30 +1,47 @@
 """
-Bitcoin Trading Environment for Reinforcement Learning.
-Based on OpenAI Gymnasium interface.
+Bitcoin Trading Environment for Reinforcement Learning - V2 (Gatekeeper)
+
+Key Design Principles:
+- RL is a GATEKEEPER, not a trader
+- RL only decides: TRADE or NO_TRADE
+- Direction is rule-based (HTF bias)
+- Exit is mechanical (SL/TP/max_duration)
+- Reward is quality-based, not PnL-centric
 """
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional
+from collections import deque
 
 
 class BitcoinTradingEnv(gym.Env):
     """
-    A Bitcoin trading environment for reinforcement learning.
+    Bitcoin Trading Environment - Gatekeeper Model
+
+    RL Agent Role:
+        - Decides WHETHER to trade, not HOW to trade
+        - Direction comes from HTF bias (rule-based)
+        - RL learns: "Is this a good setup to enter?"
 
     Action Space:
-        0: Hold (do nothing)
-        1-9: Open Long with SL/TP combinations
-        10-18: Open Short with SL/TP combinations
-        19: Close position
+        0: NO_TRADE (wait)
+        1: TRADE (execute based on HTF bias)
 
-    Observation Space:
-        Window of historical features (window_size x num_features)
+    Exit Mechanism:
+        - Stop Loss (fixed %)
+        - Take Profit (fixed %)
+        - Max Duration timeout
+        - NO manual close by RL
     """
 
     metadata = {'render_modes': ['human']}
+
+    # Bias thresholds
+    BIAS_THRESHOLD = 0.3  # Minimum MTF alignment for valid bias
+    QUALITY_THRESHOLD = 0.0  # Minimum quality to consider trading
 
     def __init__(
         self,
@@ -33,12 +50,12 @@ class BitcoinTradingEnv(gym.Env):
         window_size: int = 48,
         initial_capital: float = 10000.0,
         max_position_duration: int = 72,
-        sl_options: list = None,
-        tp_options: list = None,
+        sl_pct: float = 0.02,  # Fixed 2% SL
+        tp_pct: float = 0.04,  # Fixed 4% TP (R:R = 1:2)
         spread_pct: float = 0.001,
         commission_pct: float = 0.001,
-        max_position_pct: float = 0.20,  # Max %20 risk per trade
-        simple_actions: bool = True,  # Use simplified 5-action space
+        max_position_pct: float = 0.20,
+        max_trades_per_day: int = 3,  # Trade frequency limit
         render_mode: str = None
     ):
         super().__init__()
@@ -48,39 +65,21 @@ class BitcoinTradingEnv(gym.Env):
         self.window_size = window_size
         self.initial_capital = initial_capital
         self.max_position_duration = max_position_duration
+        self.sl_pct = sl_pct
+        self.tp_pct = tp_pct
         self.spread_pct = spread_pct
         self.commission_pct = commission_pct
-        self.max_position_pct = max_position_pct  # Max position size as % of capital
-        self.simple_actions = simple_actions
+        self.max_position_pct = max_position_pct
+        self.max_trades_per_day = max_trades_per_day
         self.render_mode = render_mode
 
-        # SL/TP options as percentages
-        self.sl_options = sl_options or [0.01, 0.02, 0.03]
-        self.tp_options = tp_options or [0.02, 0.04, 0.06]
+        # Action space: Binary (TRADE / NO_TRADE)
+        self.action_space = spaces.Discrete(2)
 
-        # Default SL/TP for simple mode (middle values)
-        self.default_sl = self.sl_options[len(self.sl_options) // 2]
-        self.default_tp = self.tp_options[len(self.tp_options) // 2]
-
-        if self.simple_actions:
-            # Simple mode: 5 actions
-            # 0: Hold, 1: Long, 2: Short, 3: Close, 4: Hold (duplicate for symmetry)
-            self.n_actions = 5
-        else:
-            # Complex mode: Full SL/TP combinations
-            n_sl = len(self.sl_options)
-            n_tp = len(self.tp_options)
-            self.n_long_actions = n_sl * n_tp
-            self.n_short_actions = n_sl * n_tp
-            self.n_actions = 1 + self.n_long_actions + self.n_short_actions + 1
-
-        # Action space
-        self.action_space = spaces.Discrete(self.n_actions)
-
-        # Observation space: window of features + position info
+        # Observation space
         n_features = feature_df.shape[1]
-        # Additional features: position_type, unrealized_pnl, position_duration
-        self.n_position_features = 3
+        # Position features: position_type, unrealized_pnl, position_duration, htf_bias
+        self.n_position_features = 4
         total_features = n_features + self.n_position_features
 
         self.observation_space = spaces.Box(
@@ -90,42 +89,16 @@ class BitcoinTradingEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Build action map
-        self._build_action_map()
+        # Reward weights (tunable)
+        self.reward_weights = {
+            'decision': 0.4,      # Weight for decision reward
+            'outcome': 0.3,       # Weight for trade outcome
+            'quality': 0.2,       # Weight for entry quality
+            'frequency': 0.1,     # Weight for frequency penalty
+        }
 
         # Initialize state
         self.reset()
-
-    def _build_action_map(self):
-        """Build mapping from action index to (direction, sl, tp)."""
-        if self.simple_actions:
-            # Simple 5-action mode
-            self.action_map = {
-                0: ('hold', None, None),
-                1: ('long', self.default_sl, self.default_tp),
-                2: ('short', self.default_sl, self.default_tp),
-                3: ('close', None, None),
-                4: ('hold', None, None),  # Extra hold for balanced action space
-            }
-        else:
-            # Complex mode with all SL/TP combinations
-            self.action_map = {0: ('hold', None, None)}
-
-            action_idx = 1
-            # Long positions
-            for sl in self.sl_options:
-                for tp in self.tp_options:
-                    self.action_map[action_idx] = ('long', sl, tp)
-                    action_idx += 1
-
-            # Short positions
-            for sl in self.sl_options:
-                for tp in self.tp_options:
-                    self.action_map[action_idx] = ('short', sl, tp)
-                    action_idx += 1
-
-            # Close position
-            self.action_map[action_idx] = ('close', None, None)
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
         """Reset the environment to initial state."""
@@ -143,15 +116,128 @@ class BitcoinTradingEnv(gym.Env):
         self.take_profit = 0.0
         self.position_duration = 0
 
-        # Tracking
+        # Quality tracking
+        self.entry_market_quality = 0.0
+        self.entry_htf_bias = 0.0
+
+        # Trade tracking
         self.trades = []
         self.equity_curve = [self.initial_capital]
         self.total_pnl = 0.0
+
+        # Trade frequency tracking (rolling 24-hour window)
+        self.recent_trades = deque(maxlen=24)  # Track trades per hour for last 24h
+        self.daily_trade_count = 0
+        self.last_trade_step = -999  # Cooldown tracking
+
+        # Metrics for analysis
+        self.decisions = {
+            'correct_no_trade': 0,  # Didn't trade in bad conditions
+            'correct_trade': 0,      # Traded in good conditions + profit
+            'wrong_no_trade': 0,     # Missed good opportunity
+            'wrong_trade': 0,        # Traded in bad conditions
+            'lucky_wins': 0,         # Profit despite bad entry
+        }
 
         obs = self._get_observation()
         info = self._get_info()
 
         return obs, info
+
+    def _get_htf_bias(self) -> float:
+        """
+        Calculate HTF (Higher Timeframe) bias for trade direction.
+        Returns: 1.0 (long), -1.0 (short), 0.0 (no trade)
+
+        Rule-based logic:
+        - Daily trend + 4H confirmation required
+        - Conflict = no bias
+        """
+        current_features = self.feature_df.iloc[self.current_step]
+
+        # Get MTF trend alignment
+        mtf_alignment = current_features.get('mtf_trend_alignment', 0.0)
+
+        # Get individual timeframe trends
+        daily_trend = current_features.get('htf_1d_trend', 0.0)
+        h4_trend = current_features.get('htf_4h_trend', 0.0)
+        h1_regime = current_features.get('market_regime', 0.0)
+
+        # Check for conflict
+        trend_conflict = current_features.get('trend_conflict', 0.0)
+        if trend_conflict > 0.5:
+            return 0.0  # No trade when timeframes conflict
+
+        # Strong confluence required
+        if mtf_alignment > self.BIAS_THRESHOLD:
+            # All timeframes bullish
+            if daily_trend > 0 and h4_trend > 0:
+                return 1.0  # LONG bias
+        elif mtf_alignment < -self.BIAS_THRESHOLD:
+            # All timeframes bearish
+            if daily_trend < 0 and h4_trend < 0:
+                return -1.0  # SHORT bias
+
+        return 0.0  # No clear bias
+
+    def _get_market_quality(self) -> float:
+        """
+        Assess current market quality for trading.
+        Returns value between -1 (bad) and 1 (good).
+        """
+        current_features = self.feature_df.iloc[self.current_step]
+        quality = 0.0
+
+        # 1. ADX (trend strength)
+        if 'adx_14' in current_features.index:
+            adx = current_features['adx_14']
+            if adx > 0.5:
+                quality += 0.25
+            elif adx < -0.5:
+                quality -= 0.3
+
+        # 2. MTF alignment (most important)
+        if 'mtf_trend_alignment' in current_features.index:
+            mtf_align = current_features['mtf_trend_alignment']
+            quality += mtf_align * 0.4
+
+        # 3. Strong confluence bonus
+        if 'mtf_strong_bull' in current_features.index:
+            if current_features['mtf_strong_bull'] > 0.5:
+                quality += 0.2
+            elif current_features.get('mtf_strong_bear', 0) > 0.5:
+                quality += 0.2
+
+        # 4. Trend conflict penalty
+        if 'trend_conflict' in current_features.index:
+            if current_features['trend_conflict'] > 0.5:
+                quality -= 0.3
+
+        # 5. HTF ADX
+        if 'htf_4h_adx' in current_features.index:
+            htf_adx = current_features['htf_4h_adx']
+            if htf_adx > 0.5:
+                quality += 0.15
+            elif htf_adx < -0.5:
+                quality -= 0.15
+
+        return max(-1.0, min(1.0, quality))
+
+    def _can_trade(self) -> bool:
+        """Check if trading is allowed (frequency limits, cooldown, etc.)."""
+        # Already in position
+        if self.position is not None:
+            return False
+
+        # Trade frequency limit
+        if self.daily_trade_count >= self.max_trades_per_day:
+            return False
+
+        # Minimum cooldown between trades (2 hours)
+        if self.current_step - self.last_trade_step < 2:
+            return False
+
+        return True
 
     def _get_observation(self) -> np.ndarray:
         """Get current observation window."""
@@ -183,7 +269,10 @@ class BitcoinTradingEnv(gym.Env):
         # Position duration (normalized)
         norm_duration = self.position_duration / self.max_position_duration
 
-        position_features[-1] = [position_type, unrealized_pnl, norm_duration]
+        # HTF bias (important for RL to know current direction)
+        htf_bias = self._get_htf_bias()
+
+        position_features[-1] = [position_type, unrealized_pnl, norm_duration, htf_bias]
 
         # Combine features
         obs = np.hstack([feature_window, position_features]).astype(np.float32)
@@ -199,7 +288,11 @@ class BitcoinTradingEnv(gym.Env):
             'entry_price': self.entry_price,
             'unrealized_pnl': self._calculate_unrealized_pnl(),
             'total_trades': len(self.trades),
-            'current_step': self.current_step
+            'current_step': self.current_step,
+            'market_quality': self._get_market_quality(),
+            'htf_bias': self._get_htf_bias(),
+            'daily_trade_count': self.daily_trade_count,
+            'decisions': self.decisions.copy()
         }
 
     def _get_current_price(self) -> float:
@@ -215,30 +308,29 @@ class BitcoinTradingEnv(gym.Env):
 
         if self.position == 'long':
             pnl = (current_price - self.entry_price) / self.entry_price * self.position_size
-        else:  # short
+        else:
             pnl = (self.entry_price - current_price) / self.entry_price * self.position_size
 
         return pnl
 
-    def _open_position(self, direction: str, sl_pct: float, tp_pct: float):
-        """Open a new position."""
+    def _open_position(self, direction: str):
+        """Open a new position with fixed SL/TP."""
         current_price = self._get_current_price()
 
         # Apply spread
         if direction == 'long':
             entry_price = current_price * (1 + self.spread_pct / 2)
-            self.stop_loss = entry_price * (1 - sl_pct)
-            self.take_profit = entry_price * (1 + tp_pct)
-        else:  # short
+            self.stop_loss = entry_price * (1 - self.sl_pct)
+            self.take_profit = entry_price * (1 + self.tp_pct)
+        else:
             entry_price = current_price * (1 - self.spread_pct / 2)
-            self.stop_loss = entry_price * (1 + sl_pct)
-            self.take_profit = entry_price * (1 - tp_pct)
+            self.stop_loss = entry_price * (1 + self.sl_pct)
+            self.take_profit = entry_price * (1 - self.tp_pct)
 
-        # Position size - use max_position_pct of capital (default 20%)
+        # Position sizing
         self.position_size = self.capital * self.max_position_pct
         commission = self.position_size * self.commission_pct
 
-        # Reserve position size from capital (money is now in the trade)
         self.capital -= self.position_size
         self.capital -= commission
 
@@ -246,7 +338,16 @@ class BitcoinTradingEnv(gym.Env):
         self.entry_price = entry_price
         self.position_duration = 0
 
-    def _close_position(self, reason: str = 'manual') -> float:
+        # Track entry conditions
+        self.entry_market_quality = self._get_market_quality()
+        self.entry_htf_bias = self._get_htf_bias()
+
+        # Update trade tracking
+        self.daily_trade_count += 1
+        self.last_trade_step = self.current_step
+        self.recent_trades.append(self.current_step)
+
+    def _close_position(self, reason: str = 'sl_tp') -> float:
         """Close current position and return PnL."""
         if self.position is None:
             return 0.0
@@ -257,7 +358,7 @@ class BitcoinTradingEnv(gym.Env):
         if self.position == 'long':
             exit_price = current_price * (1 - self.spread_pct / 2)
             pnl_pct = (exit_price - self.entry_price) / self.entry_price
-        else:  # short
+        else:
             exit_price = current_price * (1 + self.spread_pct / 2)
             pnl_pct = (self.entry_price - exit_price) / self.entry_price
 
@@ -266,8 +367,12 @@ class BitcoinTradingEnv(gym.Env):
         commission = abs(self.position_size * (1 + pnl_pct)) * self.commission_pct
         net_pnl = gross_pnl - commission
 
-        # Update capital - add back position size plus/minus PnL
         self.capital += self.position_size + net_pnl
+
+        # Determine if this was a lucky win
+        is_lucky_win = (net_pnl > 0 and self.entry_market_quality < 0)
+        if is_lucky_win:
+            self.decisions['lucky_wins'] += 1
 
         # Record trade
         self.trades.append({
@@ -279,7 +384,10 @@ class BitcoinTradingEnv(gym.Env):
             'pnl': net_pnl,
             'pnl_pct': pnl_pct * 100,
             'duration': self.position_duration,
-            'reason': reason
+            'reason': reason,
+            'entry_market_quality': self.entry_market_quality,
+            'entry_htf_bias': self.entry_htf_bias,
+            'is_lucky_win': is_lucky_win
         })
 
         self.total_pnl += net_pnl
@@ -291,6 +399,8 @@ class BitcoinTradingEnv(gym.Env):
         self.stop_loss = 0.0
         self.take_profit = 0.0
         self.position_duration = 0
+        self.entry_market_quality = 0.0
+        self.entry_htf_bias = 0.0
 
         return net_pnl
 
@@ -308,7 +418,7 @@ class BitcoinTradingEnv(gym.Env):
                 return 'stop_loss'
             if high >= self.take_profit:
                 return 'take_profit'
-        else:  # short
+        else:
             if high >= self.stop_loss:
                 return 'stop_loss'
             if low <= self.take_profit:
@@ -316,136 +426,175 @@ class BitcoinTradingEnv(gym.Env):
 
         return None
 
+    def _calculate_decision_reward(self, action: int, market_quality: float, htf_bias: float) -> float:
+        """
+        Calculate immediate reward for the decision itself.
+        This teaches the model WHEN to trade.
+        """
+        reward = 0.0
+
+        # Action: NO_TRADE (0)
+        if action == 0:
+            if market_quality < self.QUALITY_THRESHOLD or htf_bias == 0:
+                # Correct decision: Didn't trade in bad conditions
+                reward = 0.1 * (1 - market_quality)  # More reward for avoiding worse conditions
+                self.decisions['correct_no_trade'] += 1
+            elif market_quality > 0.3 and htf_bias != 0:
+                # Missed opportunity (but small penalty - being conservative is OK)
+                reward = -0.05
+                self.decisions['wrong_no_trade'] += 1
+
+        # Action: TRADE (1)
+        elif action == 1:
+            if not self._can_trade():
+                # Tried to trade when not allowed - no immediate penalty
+                # (the lack of position is punishment enough)
+                pass
+            elif htf_bias == 0:
+                # Tried to trade with no bias - BAD
+                reward = -0.2
+                self.decisions['wrong_trade'] += 1
+            elif market_quality < self.QUALITY_THRESHOLD:
+                # Trading in bad conditions - BAD
+                reward = -0.15 * abs(market_quality)
+                self.decisions['wrong_trade'] += 1
+            else:
+                # Trading in good conditions with bias - potentially good
+                # Final verdict comes from outcome reward
+                reward = 0.05 * market_quality
+                self.decisions['correct_trade'] += 1
+
+        return reward
+
+    def _calculate_outcome_reward(self, pnl: float, reason: str) -> float:
+        """
+        Calculate reward when trade closes.
+        Quality-adjusted, with lucky win penalty.
+        """
+        # Normalize PnL
+        normalized_pnl = pnl / self.initial_capital
+        entry_quality = self.entry_market_quality
+
+        # Base outcome (small weight on raw PnL)
+        pnl_component = normalized_pnl * 50  # Reduced from 100
+
+        # Quality adjustment
+        quality_component = 0.0
+
+        if pnl > 0:
+            # Profitable trade
+            if entry_quality > 0:
+                # Good setup + profit = well done
+                quality_component = entry_quality * 2.0
+            else:
+                # LUCKY WIN - bad setup + profit
+                # Clamp the reward, don't reinforce this behavior
+                pnl_component = min(pnl_component, 0.5)  # Cap the profit reward
+                quality_component = -0.5  # Penalty for lucky win
+        else:
+            # Losing trade
+            if entry_quality < 0:
+                # Bad setup + loss = extra penalty (should have known)
+                quality_component = entry_quality * 1.5  # Amplify penalty
+            else:
+                # Good setup + loss = acceptable (SL did its job)
+                quality_component = 0.0  # Neutral
+
+        # Exit reason adjustment
+        reason_modifier = 1.0
+        if reason == 'take_profit':
+            reason_modifier = 1.1
+        elif reason == 'max_duration':
+            reason_modifier = 0.8
+        # stop_loss is neutral (1.0)
+
+        total = (pnl_component + quality_component) * reason_modifier
+
+        return total
+
+    def _calculate_frequency_penalty(self) -> float:
+        """
+        Penalize overtrading.
+        """
+        penalty = 0.0
+
+        # Penalty for approaching daily limit
+        if self.daily_trade_count > self.max_trades_per_day * 0.7:
+            penalty -= 0.05 * (self.daily_trade_count / self.max_trades_per_day)
+
+        return penalty
+
     def step(self, action) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """Execute one step in the environment."""
         reward = 0.0
         done = False
         truncated = False
 
-        # Convert numpy array to int if needed
+        # Convert action
         if hasattr(action, 'item'):
             action = action.item()
         action = int(action)
 
-        # Get action details
-        action_type, sl, tp = self.action_map[action]
+        # Get current market state
+        market_quality = self._get_market_quality()
+        htf_bias = self._get_htf_bias()
 
-        # Check SL/TP first (before any action)
-        sl_tp_hit = self._check_sl_tp()
-        if sl_tp_hit:
-            pnl = self._close_position(reason=sl_tp_hit)
-            reward = self._calculate_reward(pnl, reason=sl_tp_hit)
-
-        # Execute action
-        if self.position is None:
-            # No position - can open new one
-            if action_type in ['long', 'short']:
-                self._open_position(action_type, sl, tp)
-        else:
-            # Have position
-            if action_type == 'close':
-                pnl = self._close_position(reason='manual')
-                reward = self._calculate_reward(pnl, reason='manual')
-            elif self.position_duration >= self.max_position_duration:
-                # Force close if max duration reached
-                pnl = self._close_position(reason='max_duration')
-                reward = self._calculate_reward(pnl, reason='max_duration')
-
-        # Update position duration
+        # ============ HANDLE EXISTING POSITION ============
         if self.position is not None:
-            self.position_duration += 1
+            # Check SL/TP
+            sl_tp_hit = self._check_sl_tp()
+            if sl_tp_hit:
+                pnl = self._close_position(reason=sl_tp_hit)
+                reward += self._calculate_outcome_reward(pnl, reason=sl_tp_hit)
 
-        # Add step-based reward (intermediate feedback)
-        reward += self._calculate_step_reward()
+            # Check max duration
+            elif self.position_duration >= self.max_position_duration:
+                pnl = self._close_position(reason='max_duration')
+                reward += self._calculate_outcome_reward(pnl, reason='max_duration')
 
-        # Update equity
+            # Still in position - update duration
+            if self.position is not None:
+                self.position_duration += 1
+
+        # ============ HANDLE NEW DECISION ============
+        else:
+            # No position - RL makes decision
+            decision_reward = self._calculate_decision_reward(action, market_quality, htf_bias)
+            reward += decision_reward * self.reward_weights['decision']
+
+            # Execute trade if action is TRADE and conditions allow
+            if action == 1 and self._can_trade() and htf_bias != 0:
+                direction = 'long' if htf_bias > 0 else 'short'
+                self._open_position(direction)
+
+        # ============ FREQUENCY PENALTY ============
+        freq_penalty = self._calculate_frequency_penalty()
+        reward += freq_penalty * self.reward_weights['frequency']
+
+        # ============ UPDATE STATE ============
         self.equity = self.capital + self._calculate_unrealized_pnl()
         self.equity_curve.append(self.equity)
-
-        # Move to next step
         self.current_step += 1
 
-        # Check if episode is done
+        # Reset daily counter (simplified - every 24 steps)
+        if self.current_step % 24 == 0:
+            self.daily_trade_count = 0
+
+        # ============ CHECK TERMINATION ============
         if self.current_step >= len(self.df) - 1:
-            # Close any open position at end
             if self.position is not None:
                 pnl = self._close_position(reason='episode_end')
-                reward += self._calculate_reward(pnl, reason='episode_end')
+                reward += self._calculate_outcome_reward(pnl, reason='episode_end')
             done = True
 
-        # Check for bankruptcy
         if self.equity <= 0:
-            reward = -10.0  # Large penalty for bankruptcy
+            reward = -10.0
             done = True
 
         obs = self._get_observation()
         info = self._get_info()
 
         return obs, reward, done, truncated, info
-
-    def _calculate_reward(self, pnl: float, reason: str = 'manual') -> float:
-        """
-        Calculate reward for a trade.
-        Risk-adjusted with bonuses/penalties.
-        """
-        # Normalize PnL by initial capital
-        normalized_pnl = pnl / self.initial_capital
-
-        # Base reward is the normalized PnL (scaled)
-        reward = normalized_pnl * 100
-
-        # Bonus for take profit hits (good exit)
-        if reason == 'take_profit':
-            reward *= 1.5  # 50% bonus for TP
-
-        # Smaller penalty for stop loss (it's risk management, not bad)
-        elif reason == 'stop_loss':
-            reward *= 0.8  # Reduce penalty - SL is protective
-
-        # Penalty for max duration timeout (bad exit strategy)
-        elif reason == 'max_duration':
-            reward *= 0.5  # 50% penalty - should have exited earlier
-
-        # Bonus for profitable manual exits
-        elif reason == 'manual' and pnl > 0:
-            reward *= 1.2  # 20% bonus for good manual exit
-
-        # Episode end - neutral, no bonus/penalty
-        elif reason == 'episode_end':
-            pass  # Keep base reward
-
-        return reward
-
-    def _calculate_step_reward(self) -> float:
-        """
-        Calculate step-based reward for holding positions.
-        Gives intermediate feedback during trades.
-        """
-        reward = 0.0
-
-        if self.position is not None:
-            # Unrealized PnL feedback (small, to guide learning)
-            unrealized = self._calculate_unrealized_pnl()
-            normalized_unrealized = unrealized / self.initial_capital
-
-            # Small reward/penalty based on unrealized PnL
-            reward += normalized_unrealized * 2  # Scaled down for step reward
-
-            # Penalty for holding too long (encourages timely exits)
-            duration_ratio = self.position_duration / self.max_position_duration
-            if duration_ratio > 0.5:  # After 50% of max duration
-                reward -= 0.01 * duration_ratio  # Increasing penalty
-
-            # Risk penalty - if position is in significant drawdown
-            if normalized_unrealized < -0.02:  # More than 2% loss
-                reward -= 0.02  # Extra penalty for risky positions
-
-        else:
-            # Small penalty for being idle too long (encourages action)
-            # But not too much - waiting for good entry is valid
-            pass
-
-        return reward
 
     def get_trade_history(self) -> pd.DataFrame:
         """Get trade history as DataFrame."""
@@ -457,19 +606,37 @@ class BitcoinTradingEnv(gym.Env):
         """Get equity curve."""
         return np.array(self.equity_curve)
 
+    def get_decision_stats(self) -> dict:
+        """Get decision quality statistics."""
+        total = sum(self.decisions.values())
+        if total == 0:
+            return self.decisions
+
+        stats = self.decisions.copy()
+        stats['total_decisions'] = total
+        stats['correct_rate'] = (
+            stats['correct_no_trade'] + stats['correct_trade']
+        ) / max(1, total)
+        stats['lucky_win_rate'] = stats['lucky_wins'] / max(1, len(self.trades))
+
+        return stats
+
     def render(self):
         """Render the environment."""
         if self.render_mode == 'human':
+            htf_bias = self._get_htf_bias()
+            bias_str = "LONG" if htf_bias > 0 else "SHORT" if htf_bias < 0 else "NONE"
+
             print(f"Step: {self.current_step}")
-            print(f"Capital: ${self.capital:.2f}")
-            print(f"Equity: ${self.equity:.2f}")
-            print(f"Position: {self.position}")
+            print(f"Capital: ${self.capital:.2f} | Equity: ${self.equity:.2f}")
+            print(f"Position: {self.position} | HTF Bias: {bias_str}")
+            print(f"Market Quality: {self._get_market_quality():.2f}")
+            print(f"Trades Today: {self.daily_trade_count}/{self.max_trades_per_day}")
             print(f"Total Trades: {len(self.trades)}")
-            print("-" * 40)
+            print("-" * 50)
 
 
 if __name__ == "__main__":
-    # Test the environment
     from indicators import load_and_preprocess_data
 
     print("Loading data...")
@@ -483,19 +650,18 @@ if __name__ == "__main__":
     print(f"Data shape: {df.shape}")
     print(f"Features shape: {features.shape}")
 
-    print("\nCreating environment...")
+    print("\nCreating environment (V2 - Gatekeeper)...")
     env = BitcoinTradingEnv(df, features, window_size=48)
 
     print(f"Action space: {env.action_space}")
     print(f"Observation space: {env.observation_space}")
-    print(f"Action map: {env.action_map}")
 
     print("\nRunning random episode...")
     obs, info = env.reset()
     print(f"Initial observation shape: {obs.shape}")
 
     total_reward = 0
-    for i in range(100):
+    for i in range(500):
         action = env.action_space.sample()
         obs, reward, done, truncated, info = env.step(action)
         total_reward += reward
@@ -507,6 +673,10 @@ if __name__ == "__main__":
     print(f"Final equity: ${info['equity']:.2f}")
     print(f"Total trades: {info['total_trades']}")
 
+    print("\nDecision Stats:")
+    for k, v in env.get_decision_stats().items():
+        print(f"  {k}: {v}")
+
     trades = env.get_trade_history()
     if not trades.empty:
-        print(f"\nTrade history:\n{trades}")
+        print(f"\nTrade history:\n{trades[['direction', 'pnl', 'entry_market_quality', 'is_lucky_win']]}")

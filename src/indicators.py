@@ -30,6 +30,62 @@ def resample_to_timeframe(df: pd.DataFrame, timeframe: str = "1h") -> pd.DataFra
     return resampled
 
 
+def calculate_htf_indicators(df: pd.DataFrame, htf: str, prefix: str) -> pd.DataFrame:
+    """
+    Calculate higher timeframe indicators and merge back to base timeframe.
+
+    Args:
+        df: Base timeframe DataFrame with OHLCV
+        htf: Higher timeframe string (e.g., '4h', '1D')
+        prefix: Prefix for column names (e.g., 'htf_4h_')
+
+    Returns:
+        DataFrame with HTF indicators aligned to base timeframe
+    """
+    # Resample to higher timeframe
+    htf_df = df.resample(htf).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    }).dropna()
+
+    # Calculate HTF indicators
+    htf_df[f"{prefix}ema_21"] = ta.ema(htf_df["close"], length=21)
+    htf_df[f"{prefix}ema_50"] = ta.ema(htf_df["close"], length=50)
+    htf_df[f"{prefix}ema_200"] = ta.ema(htf_df["close"], length=200)
+    htf_df[f"{prefix}rsi"] = ta.rsi(htf_df["close"], length=14)
+    htf_df[f"{prefix}atr"] = ta.atr(htf_df["high"], htf_df["low"], htf_df["close"], length=14)
+
+    # ADX for trend strength
+    htf_adx = ta.adx(htf_df["high"], htf_df["low"], htf_df["close"], length=14)
+    htf_df[f"{prefix}adx"] = htf_adx["ADX_14"]
+
+    # Trend direction: 1 = bullish, -1 = bearish, 0 = neutral
+    htf_df[f"{prefix}trend"] = np.where(
+        htf_df["close"] > htf_df[f"{prefix}ema_50"],
+        np.where(htf_df[f"{prefix}ema_50"] > htf_df[f"{prefix}ema_200"], 1, 0.5),
+        np.where(htf_df[f"{prefix}ema_50"] < htf_df[f"{prefix}ema_200"], -1, -0.5)
+    )
+
+    # Price position relative to HTF EMAs
+    htf_df[f"{prefix}price_vs_ema21"] = (htf_df["close"] / htf_df[f"{prefix}ema_21"] - 1) * 100
+    htf_df[f"{prefix}price_vs_ema50"] = (htf_df["close"] / htf_df[f"{prefix}ema_50"] - 1) * 100
+
+    # EMA slope (momentum)
+    htf_df[f"{prefix}ema21_slope"] = htf_df[f"{prefix}ema_21"].pct_change(periods=3) * 100
+
+    # Select only the indicator columns (not OHLCV)
+    indicator_cols = [col for col in htf_df.columns if col.startswith(prefix)]
+    htf_indicators = htf_df[indicator_cols]
+
+    # Forward-fill to base timeframe (no look-ahead bias)
+    htf_aligned = htf_indicators.reindex(df.index, method='ffill')
+
+    return htf_aligned
+
+
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
@@ -128,6 +184,60 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_multi_timeframe_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add higher timeframe (4H, Daily) features to the base timeframe data.
+    This gives the model context about the bigger picture.
+    """
+    df = df.copy()
+
+    # 4-Hour timeframe features
+    htf_4h = calculate_htf_indicators(df, "4h", "htf_4h_")
+    for col in htf_4h.columns:
+        df[col] = htf_4h[col]
+
+    # Daily timeframe features
+    htf_1d = calculate_htf_indicators(df, "1D", "htf_1d_")
+    for col in htf_1d.columns:
+        df[col] = htf_1d[col]
+
+    # ============ MULTI-TIMEFRAME CONFLUENCE ============
+
+    # Trend alignment score: Do all timeframes agree?
+    # +1 for each bullish TF, -1 for each bearish TF
+    df["mtf_trend_alignment"] = (
+        np.sign(df["market_regime"]) +  # 1h trend
+        np.sign(df["htf_4h_trend"]) +    # 4h trend
+        np.sign(df["htf_1d_trend"])      # Daily trend
+    ) / 3  # Normalize to [-1, 1]
+
+    # Strong confluence: All timeframes agree
+    df["mtf_strong_bull"] = (
+        (df["market_regime"] > 0) &
+        (df["htf_4h_trend"] > 0) &
+        (df["htf_1d_trend"] > 0)
+    ).astype(int)
+
+    df["mtf_strong_bear"] = (
+        (df["market_regime"] < 0) &
+        (df["htf_4h_trend"] < 0) &
+        (df["htf_1d_trend"] < 0)
+    ).astype(int)
+
+    # HTF support/resistance: Price vs Daily EMA50
+    df["htf_bias"] = np.where(
+        df["htf_1d_trend"] > 0, 1,  # Daily bullish = long bias
+        np.where(df["htf_1d_trend"] < 0, -1, 0)  # Daily bearish = short bias
+    )
+
+    # Trend conflict warning (1h vs Daily disagree)
+    df["trend_conflict"] = (
+        np.sign(df["market_regime"]) != np.sign(df["htf_1d_trend"])
+    ).astype(int)
+
+    return df
+
+
 def prepare_features(df: pd.DataFrame, feature_columns: list = None) -> pd.DataFrame:
     if feature_columns is None:
         feature_columns = [
@@ -141,9 +251,19 @@ def prepare_features(df: pd.DataFrame, feature_columns: list = None) -> pd.DataF
             "adx_14", "ema_trend", "returns",
             # Price relative to EMAs
             "price_to_ema12", "price_to_ema26", "price_to_ema50", "price_to_ema200",
-            # TREND FILTER - Bull/Bear detection (NEW)
+            # TREND FILTER - Bull/Bear detection
             "trend_bull", "ema_alignment_bull", "ema_alignment_bear",
-            "trend_strength", "market_regime", "trend_momentum", "ema50_slope"
+            "trend_strength", "market_regime", "trend_momentum", "ema50_slope",
+            # ============ MULTI-TIMEFRAME FEATURES ============
+            # 4H timeframe
+            "htf_4h_trend", "htf_4h_rsi", "htf_4h_adx",
+            "htf_4h_price_vs_ema21", "htf_4h_price_vs_ema50", "htf_4h_ema21_slope",
+            # Daily timeframe
+            "htf_1d_trend", "htf_1d_rsi", "htf_1d_adx",
+            "htf_1d_price_vs_ema21", "htf_1d_price_vs_ema50", "htf_1d_ema21_slope",
+            # Confluence signals
+            "mtf_trend_alignment", "mtf_strong_bull", "mtf_strong_bear",
+            "htf_bias", "trend_conflict"
         ]
     
     feature_columns = [col for col in feature_columns if col in df.columns]
@@ -194,17 +314,23 @@ def load_and_preprocess_data(
     end_date: str = None,
     normalize: bool = True,
     scaler: StandardScaler = None,
-    scaler_path: str = None
+    scaler_path: str = None,
+    use_multi_timeframe: bool = True
 ) -> tuple:
     df = load_raw_data(csv_path)
     df = resample_to_timeframe(df, timeframe)
-    
+
     if start_date:
         df = df[df.index >= start_date]
     if end_date:
         df = df[df.index <= end_date]
-    
+
     df = add_technical_indicators(df)
+
+    # Add multi-timeframe features (4H, Daily context)
+    if use_multi_timeframe:
+        df = add_multi_timeframe_features(df)
+
     df = df.dropna()
     feature_df = prepare_features(df)
     

@@ -1,58 +1,66 @@
+# Bitcoin Trading Bot Configuration - V2 (Gatekeeper Model)
+# ============================================================
+# Key Changes from V1:
+# - RL is now a gatekeeper (TRADE/NO_TRADE only)
+# - Direction is rule-based (HTF bias)
+# - Fixed SL/TP (no RL choice)
+# - Quality-based rewards, not PnL-centric
+
 data:
-  test_end: '2025-12-31'
-  test_start: '2024-01-01'
-  timeframe: 1h
-  train_end: '2023-12-31'
-  train_path: data/btcusd_1-min_data.csv
-  train_start: '2012-01-01'
+  train_path: "data/btcusd_1-min_data.csv"
+  timeframe: "1h"
+  train_start: "2012-01-01"
+  train_end: "2023-12-31"
+  test_start: "2024-01-01"
+  test_end: "2025-12-31"
+
 environment:
+  window_size: 48           # 48 hours of history
   initial_capital: 10000
-  max_position_duration: 72
-  max_position_pct: 0.2
-  simple_actions: true
-  window_size: 48
+  max_position_duration: 72  # 72 hours max hold
+  max_position_pct: 0.20     # 20% of capital per trade
+
 features:
-  indicators:
-  - rsi_14
-  - ema_12
-  - ema_26
-  - macd
-  - macd_signal
-  - bb_upper
-  - bb_middle
-  - bb_lower
-  - atr_14
-  - adx_14
   normalize: true
-  price_features:
-  - open
-  - high
-  - low
-  - close
-  - volume
-logging:
-  model_save_path: models/
-  tensorboard_log: logs/tensorboard/
-  trade_log_path: logs/trades/
+  use_multi_timeframe: true  # Enable 4H and Daily features
+
 model:
-  algorithm: PPO
-  batch_size: 64
-  clip_range: 0.2
-  ent_coef: 0.01
-  gamma: 0.99
+  algorithm: "PPO"
+  policy: "MlpPolicy"
   learning_rate: 0.0003
-  n_epochs: 10
   n_steps: 2048
-  policy: MlpPolicy
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  ent_coef: 0.01            # Entropy for exploration
+  clip_range: 0.2
   total_timesteps: 500000
+
 trading:
-  commission_pct: 0.001
-  sl_options:
-  - 0.01
-  - 0.02
-  - 0.03
-  spread_pct: 0.001
-  tp_options:
-  - 0.02
-  - 0.04
-  - 0.06
+  # Fixed SL/TP (V2 - RL doesn't choose these)
+  sl_pct: 0.02              # 2% Stop Loss
+  tp_pct: 0.04              # 4% Take Profit (R:R = 1:2)
+
+  # Transaction costs
+  spread_pct: 0.001         # 0.1% spread
+  commission_pct: 0.001     # 0.1% commission
+
+  # Trade frequency limits (V2 - prevent overtrading)
+  max_trades_per_day: 3     # Max 3 trades per 24h
+
+logging:
+  tensorboard_log: "logs/tensorboard/"
+  model_save_path: "models/"
+  trade_log_path: "logs/trades/"
+
+# Reward weights (V2 - quality-based)
+reward:
+  decision_weight: 0.4      # Weight for decision quality
+  outcome_weight: 0.3       # Weight for trade outcome
+  quality_weight: 0.2       # Weight for entry quality bonus
+  frequency_weight: 0.1     # Weight for frequency penalty
+
+# HTF Bias settings (V2 - rule-based direction)
+htf_bias:
+  threshold: 0.3            # Min MTF alignment for valid bias
+  quality_threshold: 0.0    # Min quality to consider trading

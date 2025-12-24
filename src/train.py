@@ -178,7 +178,7 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
 
 def create_env(df, features, config):
-    """Create trading environment from config."""
+    """Create trading environment from config (V2 - Gatekeeper)."""
     env = BitcoinTradingEnv(
         df=df,
         feature_df=features,
@@ -186,11 +186,11 @@ def create_env(df, features, config):
         initial_capital=config['environment']['initial_capital'],
         max_position_duration=config['environment']['max_position_duration'],
         max_position_pct=config['environment'].get('max_position_pct', 0.20),
-        simple_actions=config['environment'].get('simple_actions', True),
-        sl_options=config['trading']['sl_options'],
-        tp_options=config['trading']['tp_options'],
+        sl_pct=config['trading'].get('sl_pct', 0.02),  # Fixed SL
+        tp_pct=config['trading'].get('tp_pct', 0.04),  # Fixed TP
         spread_pct=config['trading']['spread_pct'],
-        commission_pct=config['trading']['commission_pct']
+        commission_pct=config['trading']['commission_pct'],
+        max_trades_per_day=config['trading'].get('max_trades_per_day', 3)
     )
     return env
 
@@ -308,7 +308,7 @@ def train(config_path: str = "config.yaml"):
 
 
 def evaluate_model(model, env, name: str = ""):
-    """Evaluate model on environment."""
+    """Evaluate model on environment (V2 - Gatekeeper)."""
     obs, info = env.reset()
     total_reward = 0
     done = False
@@ -338,11 +338,25 @@ def evaluate_model(model, env, name: str = ""):
         print(f"  Avg Win: ${wins['pnl'].mean():.2f}" if len(wins) > 0 else "  Avg Win: N/A")
         print(f"  Avg Loss: ${losses['pnl'].mean():.2f}" if len(losses) > 0 else "  Avg Loss: N/A")
 
+        # Lucky wins analysis (V2 feature)
+        if 'is_lucky_win' in trades.columns:
+            lucky_wins = trades[trades['is_lucky_win'] == True]
+            print(f"  Lucky Wins: {len(lucky_wins)} ({len(lucky_wins)/len(trades)*100:.1f}%)")
+
         # Calculate max drawdown
         peak = np.maximum.accumulate(equity_curve)
         drawdown = (peak - equity_curve) / peak * 100
         max_dd = drawdown.max()
         print(f"  Max Drawdown: {max_dd:.2f}%")
+
+    # Decision stats (V2 feature)
+    if hasattr(env, 'get_decision_stats'):
+        stats = env.get_decision_stats()
+        print(f"\n  Decision Quality:")
+        print(f"    Correct Rate: {stats.get('correct_rate', 0)*100:.1f}%")
+        print(f"    Correct No-Trade: {stats.get('correct_no_trade', 0)}")
+        print(f"    Correct Trade: {stats.get('correct_trade', 0)}")
+        print(f"    Wrong Trade: {stats.get('wrong_trade', 0)}")
 
     # Plot equity curve
     plt.figure(figsize=(12, 6))
