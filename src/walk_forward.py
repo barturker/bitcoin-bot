@@ -24,7 +24,8 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 
 from indicators import load_raw_data, resample_to_timeframe, add_technical_indicators
-from indicators import add_multi_timeframe_features, prepare_features, normalize_features
+from indicators import add_multi_timeframe_features, add_market_regime_flags
+from indicators import prepare_features, normalize_features
 from trading_env import BitcoinTradingEnv
 
 
@@ -89,30 +90,45 @@ def prepare_fold_data(
     # Add indicators to each split separately
     train_df = add_technical_indicators(train_df)
     train_df = add_multi_timeframe_features(train_df)
+    train_df = add_market_regime_flags(train_df)  # V2.1 regime flags
     train_df = train_df.dropna()
 
     val_df = add_technical_indicators(val_df)
     val_df = add_multi_timeframe_features(val_df)
+    val_df = add_market_regime_flags(val_df)  # V2.1 regime flags
     val_df = val_df.dropna()
 
     # Prepare features
     train_features = prepare_features(train_df)
     val_features = prepare_features(val_df)
 
-    # Normalize - fit scaler ONLY on training data
-    scaler = StandardScaler()
-    train_features_norm = pd.DataFrame(
-        scaler.fit_transform(train_features.values),
-        index=train_features.index,
-        columns=train_features.columns
-    )
+    # Separate regime flags (don't normalize) from other features
+    regime_cols = [c for c in train_features.columns if c.startswith('regime_')]
+    norm_cols = [c for c in train_features.columns if not c.startswith('regime_')]
 
-    # Transform validation with training scaler (no fit!)
-    val_features_norm = pd.DataFrame(
-        scaler.transform(val_features.values),
-        index=val_features.index,
-        columns=val_features.columns
+    # Normalize - fit scaler ONLY on training data (skip regime flags)
+    scaler = StandardScaler()
+    train_norm_values = scaler.fit_transform(train_features[norm_cols].values)
+    val_norm_values = scaler.transform(val_features[norm_cols].values)
+
+    # Reconstruct DataFrames
+    train_features_norm = pd.DataFrame(
+        train_norm_values,
+        index=train_features.index,
+        columns=norm_cols
     )
+    # Add regime flags back (unnormalized)
+    for col in regime_cols:
+        train_features_norm[col] = train_features[col].values
+
+    val_features_norm = pd.DataFrame(
+        val_norm_values,
+        index=val_features.index,
+        columns=norm_cols
+    )
+    # Add regime flags back (unnormalized)
+    for col in regime_cols:
+        val_features_norm[col] = val_features[col].values
 
     return train_df, train_features_norm, val_df, val_features_norm, scaler
 
